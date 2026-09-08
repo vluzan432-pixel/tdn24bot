@@ -16,7 +16,8 @@ sqlite3, але вміє підключатись і до звичайного �
 """
 
 import os
-from datetime import date
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 import libsql
 
@@ -48,6 +49,13 @@ CREATE TABLE IF NOT EXISTS sent_reminders (
     PRIMARY KEY (chat_id, lesson_key, sent_date)
 );
 """
+
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def _today_kyiv() -> date:
+    return datetime.now(KYIV_TZ).date()
 
 
 def _connect():
@@ -115,7 +123,7 @@ def add_note(chat_id: int, lesson_key: str, lesson_label: str, text: str):
     conn = _connect()
     conn.execute(
         "INSERT INTO notes (chat_id, lesson_key, lesson_label, text, created_at) VALUES (?, ?, ?, ?, ?)",
-        (chat_id, lesson_key, lesson_label, text, date.today().isoformat()),
+        (chat_id, lesson_key, lesson_label, text, _today_kyiv().isoformat()),
     )
     conn.commit()
     conn.close()
