@@ -169,6 +169,30 @@ def get_notes(chat_id: int, lesson_key: str):
     return [{"id": r[0], "text": r[1], "created_at": r[2]} for r in rows]
 
 
+def notes_for_lessons(chat_id: int, lesson_keys: list[str]):
+    """Нотатки для кількох пар одним запитом.
+
+    Turso — віддалена БД, тому один спільний запит суттєво швидший за
+    окреме з'єднання для кожної пари в розкладі.
+    """
+    if not lesson_keys:
+        return {}
+    # Ключі формуються самим ботом; прибираємо дублікати, зберігаючи порядок.
+    keys = list(dict.fromkeys(lesson_keys))
+    placeholders = ", ".join("?" for _ in keys)
+    conn = _connect()
+    rows = conn.execute(
+        f"SELECT id, lesson_key, text, created_at FROM notes "
+        f"WHERE chat_id = ? AND lesson_key IN ({placeholders}) ORDER BY id",
+        [chat_id, *keys],
+    ).fetchall()
+    conn.close()
+    result = {key: [] for key in keys}
+    for note_id, key, text, created_at in rows:
+        result[key].append({"id": note_id, "text": text, "created_at": created_at})
+    return result
+
+
 def all_notes(chat_id: int):
     conn = _connect()
     rows = conn.execute(
