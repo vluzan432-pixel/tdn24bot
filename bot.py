@@ -28,6 +28,7 @@ import html
 import logging
 import os
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
@@ -72,6 +73,22 @@ dp = Dispatcher(storage=MemoryStorage())
 
 class NoteState(StatesGroup):
     waiting_text = State()
+
+
+IMPORTANT_TYPES = {"пр", "сем", "контр", "мк"}  # практичне, семінар, контрольний захід, модульний контроль
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+
+def today_kyiv() -> date:
+    """Render-сервер працює за UTC, а розклад/пари — за київським часом.
+    Використовуй цю функцію замість date.today() всюди, де йдеться про
+    'сьогодні' для студента."""
+    return datetime.now(KYIV_TZ).date()
+
+
+def now_kyiv() -> datetime:
+    return datetime.now(KYIV_TZ)
 
 
 # ---------------------------------------------------------------- рендеринг
@@ -128,6 +145,29 @@ def format_day_for_chat(chat_id: int, group: str, d: date) -> str:
     return header + "\n" + divider + divider.join(blocks)
 
 
+def upcoming_important_text(group: str) -> str:
+    today = today_kyiv()
+    lines = []
+    for offset in range(7):
+        d = today + timedelta(days=offset)
+        day_name = DAY_NAMES[d.weekday()]
+        for lesson, matches in lessons_for_date(group, d):
+            for m in matches:
+                type_key = m["type"].strip().lower().rstrip(".")
+                if type_key not in IMPORTANT_TYPES:
+                    continue
+                label, emoji = type_label(m["type"])
+                pk_suffix = " ⚠️ ПК" if m["pk"] else ""
+                subject = html.escape(lesson.get("subject") or "")
+                lines.append(
+                    f"{emoji} <b>{d.strftime('%d.%m')} ({day_name})</b> {html.escape(lesson.get('time', ''))} "
+                    f"— {subject} · {label}{pk_suffix}"
+                )
+    if not lines:
+        return "🗓 На найближчий тиждень семінарів/практичних/контролів не знайдено 🎉"
+    return "🗓 <b>Найближчі семінари / практичні / контролі (7 днів):</b>\n\n" + "\n".join(lines)
+
+
 def keyboard_for_day(group: str, d: date) -> InlineKeyboardMarkup:
     prev_day = (d - timedelta(days=1)).isoformat()
     next_day = (d + timedelta(days=1)).isoformat()
@@ -147,6 +187,7 @@ def keyboard_for_day(group: str, d: date) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📝 Нотатки", callback_data=f"notes_menu:{d.isoformat()}")])
 
     rows.append([InlineKeyboardButton(text="🔔 Нагадування", callback_data="reminders_menu")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -204,6 +245,30 @@ def group_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def main_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
+        [InlineKeyboardButton(text="🗓 Найближчі сем./практ./контролі", callback_data="upcoming")],
+        [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
+        [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]])
+
+
+def individual_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📤 Завантажити файл", callback_data="individual_upload")],
+        [InlineKeyboardButton(text="👀 Переглянути свої", callback_data="individual_view")],
+        [InlineKeyboardButton(text="🗑 Видалити", callback_data="individual_delete")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     user = db.get_user(chat_id)
     on = user["reminders_on"] if user else True
@@ -238,8 +303,52 @@ async def cmd_start(message: Message):
     group = await require_group(message)
     if not group:
         return
-    today = date.today()
-    await message.answer(format_day_for_chat(message.from_user.id, group, today), reply_markup=keyboard_for_day(group, today))
+    await message.answer("Що показати?", reply_markup=main_menu_keyboard())
+
+
+@dp.callback_query(F.data == "main_menu")
+async def cb_main_menu(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text("Що показати?", reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "choose_group")
+async def cb_choose_group(callback: CallbackQuery):
+    await callback.message.edit_text("Обери свою групу:", reply_markup=group_choice_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "upcoming")
+async def cb_upcoming(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text(upcoming_important_text(group), reply_markup=back_to_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "individual_menu")
+async def cb_individual_menu(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        "🎓 <b>Індивідуальні заняття</b>\n\n"
+        "Розділ ще в розробці — скоро тут можна буде завантажити свій файл з індивідуальним планом.",
+        reply_markup=individual_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.in_({"individual_upload", "individual_view", "individual_delete"}))
+async def cb_individual_stub(callback: CallbackQuery):
+    await callback.answer("Ця функція ще в розробці 🚧", show_alert=True)
 
 
 @dp.message(Command("group"))
@@ -274,11 +383,8 @@ async def cmd_delnote(message: Message):
 async def cb_setgroup(callback: CallbackQuery):
     group = callback.data.split(":", 1)[1]
     db.set_group(callback.from_user.id, group)
-    today = date.today()
-    await callback.message.edit_text(
-        format_day_for_chat(callback.from_user.id, group, today), reply_markup=keyboard_for_day(group, today)
-    )
-    await callback.answer(f"Група {group} збережена ✅")
+    await callback.message.edit_text(f"Група {html.escape(group)} збережена ✅\n\nЩо показати?", reply_markup=main_menu_keyboard())
+    await callback.answer()
 
 
 @dp.callback_query(F.data == "today")
@@ -287,7 +393,7 @@ async def cb_today(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    today = date.today()
+    today = today_kyiv()
     await callback.message.edit_text(
         format_day_for_chat(callback.from_user.id, group, today), reply_markup=keyboard_for_day(group, today)
     )
@@ -505,7 +611,7 @@ async def note_text_received(message: Message, state: FSMContext):
 # --------------------------------------------------------------- нагадування
 
 async def check_reminders():
-    now = datetime.now()
+    now = now_kyiv()
     today = now.date()
     day_name = DAY_NAMES[today.weekday()]
 
@@ -516,7 +622,7 @@ async def check_reminders():
             start = lesson_start_time(lesson)
             if not start:
                 continue
-            start_dt = datetime.combine(today, start)
+            start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
             minutes_until = (start_dt - now).total_seconds() / 60
             if not (0 < minutes_until <= lead):
                 continue
