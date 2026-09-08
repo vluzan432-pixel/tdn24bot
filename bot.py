@@ -750,11 +750,11 @@ def main_menu_text(group: str) -> str:
     return (
         f"🎓 <b>{html.escape(group)}</b>\n"
         "Обери розділ:\n\n"
-        "📅 <b>Розклад пар</b> — заняття на день, гортання по датах\n"
-        "🗓 <b>Найближчі сем./практ./контролі</b> — важливе на тиждень наперед\n"
-        "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад\n"
+        "📅 <b>Розклад пар</b> — заняття на день, гортання по датах або одразу через 📆 календар\n"
+        "🗓 <b>Найближчі семінари / практичні / ПК</b> — важливе на кілька тижнів наперед, без рутинних практичних\n"
+        "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад, вручну або імпортом з Excel\n"
         "📚 <b>Матеріали</b> — посилання від старости та викладачів\n"
-        "⚙️ <b>Налаштування</b> — нагадування й розклад на завтра\n"
+        "⚙️ <b>Налаштування</b> — нагадування перед парою, розклад на завтра, оголошення\n"
         "✏️ <b>Редагувати розклад</b> — виправити пару, якщо її перенесли\n"
         "👥 <b>Вибір групи</b> — змінити групу"
     )
@@ -763,7 +763,7 @@ def main_menu_text(group: str) -> str:
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
-        [InlineKeyboardButton(text="🗓 Найближчі сем./практ./контролі", callback_data="upcoming")],
+        [InlineKeyboardButton(text="🗓 Найближчі семінари / практичні / ПК", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
         [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
         [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
