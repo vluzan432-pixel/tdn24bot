@@ -143,10 +143,8 @@ def keyboard_for_day(group: str, d: date) -> InlineKeyboardMarkup:
     if any(find_zoom(lesson.get("teacher")) for lesson, _ in entries):
         rows.append([InlineKeyboardButton(text="🎥 Посилання в Zoom", callback_data=f"zoom_menu:{d.isoformat()}")])
 
-    for idx, (lesson, _matches) in enumerate(entries):
-        subject = lesson.get("subject") or f"Пара {lesson.get('pair')}"
-        label = subject if len(subject) <= 30 else subject[:27] + "..."
-        rows.append([InlineKeyboardButton(text=f"📝 Нотатка: {label}", callback_data=f"note:{d.isoformat()}:{idx}")])
+    if entries:
+        rows.append([InlineKeyboardButton(text="📝 Нотатки", callback_data=f"notes_menu:{d.isoformat()}")])
 
     rows.append([InlineKeyboardButton(text="🔔 Нагадування", callback_data="reminders_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -172,6 +170,33 @@ def zoom_info_keyboard(d: date) -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📅 До розкладу", callback_data=f"day:{d.isoformat()}")],
         ]
     )
+
+
+def notes_menu_keyboard(chat_id: int, group: str, d: date) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, (lesson, _matches) in enumerate(lessons_for_date(group, d)):
+        key = lesson_key(group, DAY_NAMES[d.weekday()], lesson)
+        count = len(db.get_notes(chat_id, key))
+        subject = lesson.get("subject") or f"Пара {lesson.get('pair')}"
+        label = subject if len(subject) <= 30 else subject[:27] + "..."
+        mark = f"📝×{count}" if count else "➕"
+        rows.append([InlineKeyboardButton(text=f"{mark} {label}", callback_data=f"notes_lesson:{d.isoformat()}:{idx}")])
+    rows.append([InlineKeyboardButton(text="🔙 До розкладу", callback_data=f"day:{d.isoformat()}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def notes_lesson_keyboard(d: date, idx: int, notes: list) -> InlineKeyboardMarkup:
+    rows = []
+    for i, n in enumerate(notes, start=1):
+        rows.append(
+            [
+                InlineKeyboardButton(text=f"✏️ Редагувати #{i}", callback_data=f"noteedit:{d.isoformat()}:{idx}:{n['id']}"),
+                InlineKeyboardButton(text=f"🗑 Видалити #{i}", callback_data=f"notedel:{d.isoformat()}:{idx}:{n['id']}"),
+            ]
+        )
+    rows.append([InlineKeyboardButton(text="➕ Додати нотатку", callback_data=f"noteadd:{d.isoformat()}:{idx}")])
+    rows.append([InlineKeyboardButton(text="🔙 До списку предметів", callback_data=f"notes_menu:{d.isoformat()}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def group_choice_keyboard() -> InlineKeyboardMarkup:
@@ -354,36 +379,127 @@ async def cb_toggle_reminders(callback: CallbackQuery):
     await callback.answer("Готово ✅")
 
 
-@dp.callback_query(F.data.startswith("note:"))
-async def cb_note(callback: CallbackQuery, state: FSMContext):
+def _lesson_or_none(group: str, d: date, idx: int):
+    entries = lessons_for_date(group, d)
+    if idx >= len(entries):
+        return None
+    return entries[idx][0]
+
+
+async def _show_notes_lesson(target, chat_id: int, group: str, d: date, idx: int):
+    lesson = _lesson_or_none(group, d, idx)
+    if not lesson:
+        await target.answer("Ця пара вже не актуальна, спробуй ще раз із поточного розкладу.", show_alert=True)
+        return
+    key = lesson_key(group, DAY_NAMES[d.weekday()], lesson)
+    notes = db.get_notes(chat_id, key)
+    subject = lesson.get("subject") or f"Пара {lesson.get('pair')}"
+    if notes:
+        lines = [f"📝 <b>{html.escape(subject)}</b>\n"]
+        for i, n in enumerate(notes, start=1):
+            lines.append(f"{i}. {html.escape(n['text'])}")
+        text = "\n".join(lines)
+    else:
+        text = f"📝 <b>{html.escape(subject)}</b>\n\nНотаток поки немає."
+    await target.message.edit_text(text, reply_markup=notes_lesson_keyboard(d, idx, notes))
+
+
+@dp.callback_query(F.data.startswith("notes_menu:"))
+async def cb_notes_menu(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    d = date.fromisoformat(callback.data.split(":", 1)[1])
+    await callback.message.edit_text("📝 Обери предмет:", reply_markup=notes_menu_keyboard(callback.from_user.id, group, d))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notes_lesson:"))
+async def cb_notes_lesson(callback: CallbackQuery):
     group = await require_group(callback)
     if not group:
         await callback.answer()
         return
     _, iso_date, idx_str = callback.data.split(":", 2)
-    await state.update_data(group=group, iso_date=iso_date, idx=int(idx_str))
+    d = date.fromisoformat(iso_date)
+    await _show_notes_lesson(callback, callback.from_user.id, group, d, int(idx_str))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("noteadd:"))
+async def cb_note_add(callback: CallbackQuery, state: FSMContext):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    _, iso_date, idx_str = callback.data.split(":", 2)
+    await state.update_data(mode="add", group=group, iso_date=iso_date, idx=int(idx_str))
     await state.set_state(NoteState.waiting_text)
     await callback.message.answer("Напиши текст нотатки чи дедлайн для цієї пари (одним повідомленням):")
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("noteedit:"))
+async def cb_note_edit(callback: CallbackQuery, state: FSMContext):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    _, iso_date, idx_str, note_id_str = callback.data.split(":", 3)
+    note = db.get_note(callback.from_user.id, int(note_id_str))
+    if not note:
+        await callback.answer("Нотатку не знайдено", show_alert=True)
+        return
+    await state.update_data(mode="edit", group=group, iso_date=iso_date, idx=int(idx_str), note_id=int(note_id_str))
+    await state.set_state(NoteState.waiting_text)
+    await callback.message.answer(
+        f"Поточний текст:\n<i>{html.escape(note['text'])}</i>\n\nНапиши новий текст нотатки (одним повідомленням):"
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("notedel:"))
+async def cb_note_delete(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    _, iso_date, idx_str, note_id_str = callback.data.split(":", 3)
+    db.delete_note(callback.from_user.id, int(note_id_str))
+    d = date.fromisoformat(iso_date)
+    await _show_notes_lesson(callback, callback.from_user.id, group, d, int(idx_str))
+    await callback.answer("Видалено ✅")
 
 
 @dp.message(StateFilter(NoteState.waiting_text))
 async def note_text_received(message: Message, state: FSMContext):
     data = await state.get_data()
     await state.clear()
-    group, iso_date, idx = data["group"], data["iso_date"], data["idx"]
+    mode, group, iso_date, idx = data["mode"], data["group"], data["iso_date"], data["idx"]
     d = date.fromisoformat(iso_date)
     day_name = DAY_NAMES[d.weekday()]
-    entries = lessons_for_date(group, d)
-    if idx >= len(entries):
+    lesson = _lesson_or_none(group, d, idx)
+    if not lesson:
         await message.answer("Ця пара вже не актуальна, спробуй ще раз із поточного розкладу.")
         return
-    lesson, _matches = entries[idx]
+
+    if mode == "edit":
+        db.update_note(message.from_user.id, data["note_id"], message.text)
+        await message.answer("Оновлено ✅")
+    else:
+        key = lesson_key(group, day_name, lesson)
+        label = f"{lesson.get('subject') or 'Пара'} ({day_name}, {lesson.get('time')})"
+        db.add_note(message.from_user.id, key, label, message.text)
+        await message.answer("Збережено ✅")
+
     key = lesson_key(group, day_name, lesson)
-    label = f"{lesson.get('subject') or 'Пара'} ({day_name}, {lesson.get('time')})"
-    db.add_note(message.from_user.id, key, label, message.text)
-    await message.answer("Збережено ✅")
-    await message.answer(format_day_for_chat(message.from_user.id, group, d), reply_markup=keyboard_for_day(group, d))
+    notes = db.get_notes(message.from_user.id, key)
+    subject = lesson.get("subject") or f"Пара {lesson.get('pair')}"
+    lines = [f"📝 <b>{html.escape(subject)}</b>\n"]
+    for i, n in enumerate(notes, start=1):
+        lines.append(f"{i}. {html.escape(n['text'])}")
+    await message.answer("\n".join(lines), reply_markup=notes_lesson_keyboard(d, idx, notes))
 
 
 # --------------------------------------------------------------- нагадування
