@@ -203,6 +203,61 @@ def _import_schedule_from_excel(data: bytes, surname: str) -> list[dict]:
     book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
     found: list[dict] = []
     seen = set()
+
+    # Основний формат розкладу кафедри: один рядок = одне заняття, із
+    # заголовками «Прізвище здобувача», «День тижня», «Тривалість» тощо.
+    # Це надійніше за пошук сусідніх комірок і не плутає викладача з предметом.
+    header_aliases = {
+        "student": ("прізвище", "здобувача"),
+        "weekday": ("день", "тижня"),
+        "date": ("дата",),
+        "time": ("тривалість",),
+        "room": ("аудиторія",),
+        "teacher": ("прізвище", "викладача"),
+        "subject": ("назва", "компоненти"),
+    }
+    for sheet in book.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        for header_row, header in enumerate(rows):
+            columns = {}
+            for name, parts in header_aliases.items():
+                columns[name] = next(
+                    (index for index, value in enumerate(header) if all(part in _normalized(value) for part in parts)),
+                    None,
+                )
+            if any(columns[name] is None for name in ("student", "weekday", "date", "time", "subject")):
+                continue
+            for row in rows[header_row + 1:]:
+                if columns["student"] >= len(row) or needle not in _normalized(row[columns["student"]]):
+                    continue
+                time = str(row[columns["time"]] or "").strip()
+                weekday = _weekday_in(row[columns["weekday"]])
+                date_value = _date_in(row[columns["date"]])
+                subject = str(row[columns["subject"]] or "Індивідуальне заняття").strip()
+                if not time or not (weekday or date_value):
+                    continue
+                key = (weekday, date_value, time, subject)
+                if key in seen:
+                    continue
+                seen.add(key)
+                found.append(
+                    {
+                        # Якщо в Excel є точна дата, це разове заняття в
+                        # календарі, а не правило «щотижня в цей день».
+                        "weekday": None if date_value else weekday,
+                        "date": date_value,
+                        "time": time,
+                        "subject": subject,
+                        "teacher": str(row[columns["teacher"]] or "").strip() if columns["teacher"] is not None else None,
+                        "room": str(row[columns["room"]] or "").strip() if columns["room"] is not None else None,
+                    }
+                )
+    if found:
+        book.close()
+        return found
+
+    # Запасний режим для простіших або нестандартних файлів. Його результат
+    # завжди показується перед збереженням.
     for sheet in book.worksheets:
         rows = [list(row) for row in sheet.iter_rows(values_only=True)]
         for row_index, row in enumerate(rows):
