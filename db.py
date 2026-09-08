@@ -304,6 +304,13 @@ def delete_note(chat_id: int, note_id: int):
     conn.close()
 
 
+def delete_all_notes(chat_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM notes WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
 def was_reminder_sent(chat_id: int, lesson_key: str, day_iso: str) -> bool:
     conn = _connect()
     row = conn.execute(
