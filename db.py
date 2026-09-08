@@ -536,6 +536,26 @@ def delete_individual_lesson(chat_id: int, lesson_id: int):
     conn.close()
 
 
+def delete_all_individual_lessons(chat_id: int):
+    """Видаляє геть усі індивідуальні заняття користувача — і ручні, і
+    імпортовані з Excel. Використовується кнопкою "Видалити всі", зокрема
+    перед повторним імпортом оновленого файлу."""
+    conn = _connect()
+    conn.execute("DELETE FROM individual_lessons WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def has_imported_individual_lessons(chat_id: int) -> bool:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT 1 FROM individual_lessons WHERE chat_id = ? AND source = 'import' LIMIT 1",
+        (chat_id,),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
 def replace_imported_individual_lessons(chat_id: int, lessons: list[dict]):
     """Оновлює лише заняття, створені імпортом Excel. Ручні записи лишаються."""
     conn = _connect()
