@@ -1209,6 +1209,15 @@ async def note_text_received(message: Message, state: FSMContext):
 
 # --------------------------------------------------------------- нагадування
 
+# GitHub Actions на безкоштовних/публічних репо реально запускає schedule-cron
+# з інтервалами 10-13+ хв замість заданих 5 (документована особливість GH,
+# не помилка налаштування). Якщо ловити лише вузьке вікно (0; lead] хвилин
+# ДО пари, воно легко "провалюється" між двома запусками cron і нагадування
+# не надсилається взагалі. GRACE_MINUTES дозволяє долавити пари, момент
+# нагадування яких вже трохи минув, поки бот не встиг перевірити.
+GRACE_MINUTES = 10
+
+
 async def check_reminders():
     now = now_kyiv()
     today = now.date()
@@ -1231,12 +1240,18 @@ async def check_reminders():
                     continue
                 start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
                 minutes_until = (start_dt - now).total_seconds() / 60
-                if not (0 < minutes_until <= lead):
+                if not (-GRACE_MINUTES <= minutes_until <= lead):
                     continue
                 key = entry["note_key"]
                 if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
                     continue
-                text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
+                if minutes_until > 0:
+                    text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
+                else:
+                    text = (
+                        f"⏰ Пара вже почалась {abs(int(minutes_until))} хв тому "
+                        f"(затримка пінгу):\n\n{format_entry(entry)}"
+                    )
                 try:
                     await bot.send_message(user["chat_id"], text)
                 except Exception:
