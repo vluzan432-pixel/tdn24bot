@@ -356,7 +356,13 @@ def build_day_entries(chat_id: int, group: str, d: date):
 
     for lesson, matches in lessons_for_date(group, d):
         pk = (lesson["pair"], lesson["time"])
-        note_key = lesson_key(group, day_name, lesson)
+        # КРИТИЧНО: ключ нотатки включає саму дату (d.isoformat()), а не лише
+        # день тижня. Розклад чергує предмети по тижнях (парний/непарний
+        # тиждень) — той самий номер пари/часу в п'ятницю може бути зовсім
+        # іншим предметом наступного тижня. Без дати в ключі нотатка,
+        # додана до пари в одну п'ятницю, "перетікала" на той самий слот
+        # у будь-яку іншу п'ятницю — навіть якщо там інший предмет.
+        note_key = f"{lesson_key(group, day_name, lesson)}|{d.isoformat()}"
 
         if pk in cancel_map:
             entries.append(
@@ -1632,8 +1638,41 @@ async def cmd_notes(message: Message):
     lines = ["📝 <b>Твої нотатки:</b>\n"]
     for n in notes:
         lines.append(f"• <b>{html.escape(n['lesson_label'])}</b>: {html.escape(n['text'])} (id {n['id']})")
-    lines.append("\nВидалити: <code>/delnote ID</code>")
-    await message.answer("\n".join(lines))
+    lines.append("\nВидалити одну: <code>/delnote ID</code>")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🗑 Видалити всі нотатки", callback_data="notes_delete_all_ask")],
+    ])
+    await message.answer("\n".join(lines), reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "notes_delete_all_ask")
+async def cb_notes_delete_all_ask(callback: CallbackQuery):
+    notes = db.all_notes(callback.from_user.id)
+    if not notes:
+        await callback.answer("У тебе й так немає нотаток.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, видалити все", callback_data="notes_delete_all_yes")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="notes_delete_all_cancel")],
+    ])
+    await callback.message.edit_text(
+        f"Видалити всі нотатки ({len(notes)} шт.)? Це не можна скасувати.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "notes_delete_all_yes")
+async def cb_notes_delete_all_yes(callback: CallbackQuery):
+    db.delete_all_notes(callback.from_user.id)
+    await callback.message.edit_text("Видалено всі нотатки ✅")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "notes_delete_all_cancel")
+async def cb_notes_delete_all_cancel(callback: CallbackQuery):
+    await callback.message.edit_text("Скасовано, нотатки на місці.")
+    await callback.answer()
 
 
 @dp.message(Command("delnote"))
