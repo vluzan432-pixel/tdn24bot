@@ -674,22 +674,34 @@ def back_to_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")]])
 
 
-def individual_menu_text() -> str:
-    return (
+def individual_menu_text(chat_id: int) -> str:
+    base = (
         "🎓 <b>Індивідуальні заняття</b>\n\n"
         "Тут можна додати власні заняття (інструмент, вокал тощо), які бачиш "
-        "тільки ти — вони з'являться в твоєму розкладі дня поруч із парами групи.\n\n"
-        "Можна також завантажити Excel-розклад і знайти себе за прізвищем."
+        "тільки ти — вони з'являться в твоєму розкладі дня поруч із парами групи."
     )
+    if db.has_imported_individual_lessons(chat_id):
+        base += (
+            "\n\n📥 Excel-розклад уже завантажено. Щоб залити оновлений файл — "
+            "спершу видали поточні заняття кнопкою нижче, потім тисни "
+            "«Додати файл Excel» знову."
+        )
+    else:
+        base += "\n\nМожна також завантажити Excel-розклад і знайти себе за прізвищем."
+    return base
 
 
-def individual_menu_keyboard() -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="➕ Додати заняття", callback_data="ind_add")],
-        [InlineKeyboardButton(text="📥 Додати файл Excel", callback_data="ind_import")],
-        [InlineKeyboardButton(text="👀 Мої заняття", callback_data="ind_view")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
-    ]
+def individual_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    lessons = db.all_individual_lessons(chat_id)
+    has_import = any(l.get("source") == "import" for l in lessons)
+
+    rows = [[InlineKeyboardButton(text="➕ Додати заняття", callback_data="ind_add")]]
+    if not has_import:
+        rows.append([InlineKeyboardButton(text="📥 Додати файл Excel", callback_data="ind_import")])
+    if lessons:
+        rows.append([InlineKeyboardButton(text="👀 Мої заняття", callback_data="ind_view")])
+        rows.append([InlineKeyboardButton(text="🗑 Видалити всі індивідуальні заняття", callback_data="ind_delete_all_ask")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -864,7 +876,7 @@ async def cb_edit_scope_personal(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text(individual_menu_text(), reply_markup=individual_menu_keyboard())
+    await callback.message.edit_text(individual_menu_text(callback.from_user.id), reply_markup=individual_menu_keyboard(callback.from_user.id))
     await callback.answer()
 
 
@@ -1107,7 +1119,9 @@ async def cb_individual_menu(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text(individual_menu_text(), reply_markup=individual_menu_keyboard())
+    await callback.message.edit_text(
+        individual_menu_text(callback.from_user.id), reply_markup=individual_menu_keyboard(callback.from_user.id)
+    )
     await callback.answer()
 
 
@@ -1121,9 +1135,44 @@ async def cb_ind_add(callback: CallbackQuery, state: FSMContext):
 
 @dp.callback_query(F.data == "ind_import")
 async def cb_ind_import(callback: CallbackQuery, state: FSMContext):
+    if db.has_imported_individual_lessons(callback.from_user.id):
+        await callback.answer(
+            "Excel уже завантажено. Спершу видали поточні заняття кнопкою "
+            "«🗑 Видалити всі індивідуальні заняття», потім тисни цю кнопку знову.",
+            show_alert=True,
+        )
+        return
     await state.clear()
     await state.set_state(ImportScheduleState.waiting_file)
     await callback.message.answer("Надішли Excel-файл розкладу у форматі .xlsx (до 5 МБ).")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ind_delete_all_ask")
+async def cb_ind_delete_all_ask(callback: CallbackQuery):
+    lessons = db.all_individual_lessons(callback.from_user.id)
+    if not lessons:
+        await callback.answer("У тебе й так немає індивідуальних занять.", show_alert=True)
+        return
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Так, видалити все", callback_data="ind_delete_all_yes")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="individual_menu")],
+    ])
+    await callback.message.edit_text(
+        f"Видалити всі індивідуальні заняття ({len(lessons)} шт.), і ручні, і імпортовані з Excel? "
+        "Це не можна скасувати.",
+        reply_markup=keyboard,
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ind_delete_all_yes")
+async def cb_ind_delete_all_yes(callback: CallbackQuery):
+    db.delete_all_individual_lessons(callback.from_user.id)
+    await callback.message.edit_text(
+        "Видалено всі індивідуальні заняття ✅\nТепер можна залити оновлений Excel-файл.",
+        reply_markup=individual_menu_keyboard(callback.from_user.id),
+    )
     await callback.answer()
 
 
@@ -1197,7 +1246,7 @@ async def cb_ind_import_confirm(callback: CallbackQuery, state: FSMContext):
     await state.clear()
     await callback.message.edit_text(
         f"Збережено {len(lessons)} занять ✅\nВони показуватимуться лише у твоєму розкладі.",
-        reply_markup=individual_menu_keyboard(),
+        reply_markup=individual_menu_keyboard(callback.from_user.id),
     )
     await callback.answer()
 
@@ -1205,7 +1254,7 @@ async def cb_ind_import_confirm(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "ind_import_cancel")
 async def cb_ind_import_cancel(callback: CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("Імпорт скасовано.", reply_markup=individual_menu_keyboard())
+    await callback.message.edit_text("Імпорт скасовано.", reply_markup=individual_menu_keyboard(callback.from_user.id))
     await callback.answer()
 
 
@@ -1252,7 +1301,7 @@ async def ind_value_received(message: Message, state: FSMContext):
         teacher=values.get("teacher"),
         room=values.get("room"),
     )
-    await message.answer("Заняття додано ✅", reply_markup=individual_menu_keyboard())
+    await message.answer("Заняття додано ✅", reply_markup=individual_menu_keyboard(message.from_user.id))
 
 
 @dp.callback_query(F.data == "ind_view")
@@ -1765,15 +1814,6 @@ async def note_text_received(message: Message, state: FSMContext):
 
 
 # --------------------------------------------------------------- нагадування
-
-# GitHub Actions на безкоштовних/публічних репо реально запускає schedule-cron
-# з інтервалами 10-13+ хв замість заданих 5 (документована особливість GH,
-# не помилка налаштування). Якщо ловити лише вузьке вікно (0; lead] хвилин
-# ДО пари, воно легко "провалюється" між двома запусками cron і нагадування
-# не надсилається взагалі. GRACE_MINUTES дозволяє долавити пари, момент
-# нагадування яких вже трохи минув, поки бот не встиг перевірити.
-GRACE_MINUTES = 10
-
 
 # GitHub Actions на безкоштовних/публічних репо реально запускає schedule-cron
 # з інтервалами 10-13+ хв замість заданих 5 (документована особливість GH,
