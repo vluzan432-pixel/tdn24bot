@@ -73,9 +73,24 @@ PORT = int(os.environ.get("PORT", 10000))
 # групи. Свій id можна дізнатись командою /whoami після першого /start.
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
 
+PERMISSIONS = {"schedule", "announce", "materials", "polls"}
+PERMISSION_LABELS = {
+    "schedule": "розклад", "announce": "оголошення", "materials": "матеріали", "polls": "опитування",
+}
+
+
+def is_owner(chat_id: int) -> bool:
+    """Головний адмін із змінної Render. Його права неможливо відібрати з бота."""
+    return chat_id in ADMIN_IDS
+
+
+def has_permission(chat_id: int, permission: str) -> bool:
+    return is_owner(chat_id) or permission in db.staff_permissions(chat_id)
+
 
 def is_admin(chat_id: int) -> bool:
-    return chat_id in ADMIN_IDS
+    """Сумісність з існуючим редагуванням: адмін розкладу."""
+    return has_permission(chat_id, "schedule")
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -334,11 +349,20 @@ def format_day_for_chat(chat_id: int, group: str, d: date, entries: list | None 
 
 
 async def broadcast_group(group: str, text: str):
-    for chat_id in db.users_in_group(group):
+    await _broadcast_to(db.users_in_group(group), text)
+
+
+async def broadcast_announcement(group: str, text: str):
+    await _broadcast_to(db.announcement_users_in_group(group), text)
+
+
+async def _broadcast_to(chat_ids: list[int], text: str):
+    async def send(chat_id: int):
         try:
             await bot.send_message(chat_id, text)
         except Exception:
             log.exception("Не вдалось розіслати повідомлення %s", chat_id)
+    await asyncio.gather(*(send(chat_id) for chat_id in chat_ids))
 
 
 def upcoming_important_text(group: str) -> str:
@@ -453,6 +477,8 @@ def main_menu_text(group: str) -> str:
         "📅 <b>Розклад пар</b> — заняття на день, гортання по датах\n"
         "🗓 <b>Найближчі сем./практ./контролі</b> — важливе на тиждень наперед\n"
         "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад\n"
+        "📚 <b>Матеріали</b> — посилання від старости та викладачів\n"
+        "⚙️ <b>Налаштування</b> — нагадування й розклад на завтра\n"
         "✏️ <b>Редагувати розклад</b> — виправити пару, якщо її перенесли\n"
         "👥 <b>Вибір групи</b> — змінити групу"
     )
@@ -463,6 +489,8 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
         [InlineKeyboardButton(text="🗓 Найближчі сем./практ./контролі", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
+        [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
+        [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
         [InlineKeyboardButton(text="✏️ Редагувати розклад", callback_data="edit_menu")],
         [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
     ]
@@ -557,6 +585,8 @@ def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     user = db.get_user(chat_id)
     on = user["reminders_on"] if user else True
     minutes = user["reminder_minutes"] if user else 15
+    tomorrow_on = user["tomorrow_on"] if user else False
+    announcements_on = user["announcements_on"] if user else True
     rows = [
         [
             InlineKeyboardButton(text=("✅ 5 хв" if minutes == 5 else "5 хв"), callback_data="setmin:5"),
@@ -565,7 +595,15 @@ def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
         ],
         [InlineKeyboardButton(text=("🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування"),
                                callback_data="toggle_reminders")],
-        [InlineKeyboardButton(text="🔙 До розкладу", callback_data="today")],
+        [InlineKeyboardButton(
+            text=("✅ Розклад на завтра" if tomorrow_on else "📅 Розклад на завтра: вимкнено"),
+            callback_data="toggle_tomorrow",
+        )],
+        [InlineKeyboardButton(
+            text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
+            callback_data="toggle_announcements",
+        )],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -597,6 +635,19 @@ async def cb_main_menu(callback: CallbackQuery):
         await callback.answer()
         return
     await callback.message.edit_text(main_menu_text(group), reply_markup=main_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "settings_menu")
+async def cb_settings_menu(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Спершу обери групу", show_alert=True)
+        return
+    await callback.message.edit_text(
+        "⚙️ <b>Налаштування</b>\n\nОбери, які повідомлення хочеш отримувати:",
+        reply_markup=reminders_keyboard(callback.from_user.id),
+    )
     await callback.answer()
 
 
@@ -962,8 +1013,196 @@ async def cmd_group(message: Message):
 
 @dp.message(Command("whoami"))
 async def cmd_whoami(message: Message):
-    role = "адміністратор ✅" if is_admin(message.from_user.id) else "звичайний користувач"
+    if is_owner(message.from_user.id):
+        role = "головний адміністратор ✅"
+    else:
+        rights = db.staff_permissions(message.from_user.id)
+        role = "адміністратор: " + ", ".join(PERMISSION_LABELS[p] for p in sorted(rights)) if rights else "звичайний користувач"
     await message.answer(f"Твій chat_id: <code>{message.from_user.id}</code>\nСтатус: {role}")
+
+
+def _owner_only(message: Message) -> bool:
+    return is_owner(message.from_user.id)
+
+
+@dp.message(Command("admin"))
+async def cmd_admin(message: Message):
+    rights = PERMISSIONS if is_owner(message.from_user.id) else db.staff_permissions(message.from_user.id)
+    if not rights:
+        await message.answer("Адмін-функції тобі не доступні 🔒")
+        return
+    lines = ["🛠 <b>Адмін-команди</b>"]
+    if "schedule" in rights:
+        lines.append("• Редагування розкладу — через кнопку «✏️ Редагувати розклад».")
+    if "announce" in rights:
+        lines.append("• <code>/announce текст</code> — звичайне оголошення")
+        lines.append("• <code>/urgent текст</code> — термінове оголошення")
+    if "materials" in rights:
+        lines.append("• <code>/material Предмет | Назва | https://посилання</code>")
+    if "polls" in rights:
+        lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
+    if is_owner(message.from_user.id):
+        lines.append("• <code>/staff</code> — права заступників")
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("staff"))
+async def cmd_staff(message: Message):
+    if not _owner_only(message):
+        await message.answer("Керувати правами може тільки головний адміністратор 🔒")
+        return
+    lines = ["🛠 <b>Команда бота</b>", "\nГоловний адміністратор — ти (права з Render)."]
+    for staff in db.all_staff():
+        rights = ", ".join(PERMISSION_LABELS[p] for p in sorted(staff["permissions"]) if p in PERMISSION_LABELS)
+        lines.append(f"• <code>{staff['chat_id']}</code> — {rights or 'без прав'}")
+    lines.append(
+        "\nДати права: <code>/grant ID schedule,announce</code>\n"
+        "Доступні: schedule, announce, materials, polls\n"
+        "Забрати всі права: <code>/revoke ID</code>"
+    )
+    await message.answer("\n".join(lines))
+
+
+@dp.message(Command("grant"))
+async def cmd_grant(message: Message):
+    if not _owner_only(message):
+        await message.answer("Лише головний адміністратор може змінювати права 🔒")
+        return
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Приклад: <code>/grant 123456789 schedule,announce</code>")
+        return
+    permissions = {p.strip().lower() for p in parts[2].split(",") if p.strip()}
+    invalid = permissions - PERMISSIONS
+    if not permissions or invalid:
+        await message.answer("Дозволені права: <code>schedule, announce, materials, polls</code>")
+        return
+    chat_id = int(parts[1])
+    db.set_staff_permissions(chat_id, permissions, message.from_user.id)
+    labels = ", ".join(PERMISSION_LABELS[p] for p in sorted(permissions))
+    await message.answer(f"Права для <code>{chat_id}</code> збережено: {labels} ✅")
+
+
+@dp.message(Command("revoke"))
+async def cmd_revoke(message: Message):
+    if not _owner_only(message):
+        await message.answer("Лише головний адміністратор може змінювати права 🔒")
+        return
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Приклад: <code>/revoke 123456789</code>")
+        return
+    db.remove_staff(int(parts[1]))
+    await message.answer("Усі додаткові права забрано ✅")
+
+
+def _announcement_target(text: str, default_group: str) -> tuple[str, str]:
+    first, sep, rest = text.strip().partition(" ")
+    if first in GROUPS and sep:
+        return first, rest.strip()
+    return default_group, text.strip()
+
+
+@dp.message(Command("announce"))
+async def cmd_announce(message: Message):
+    if not has_permission(message.from_user.id, "announce"):
+        await message.answer("Для оголошень потрібне право <code>announce</code> 🔒")
+        return
+    group = await require_group(message)
+    if not group:
+        return
+    text = message.text.partition(" ")[2]
+    target_group, text = _announcement_target(text, group)
+    if not text:
+        await message.answer("Приклад: <code>/announce Завтра збір о 9:00</code>\nАбо: <code>/announce ТДН-24 Текст</code>")
+        return
+    await broadcast_announcement(target_group, f"📣 <b>Оголошення</b>\n\n{html.escape(text)}")
+    await message.answer(f"Оголошення надіслано для {html.escape(target_group)} ✅")
+
+
+@dp.message(Command("urgent"))
+async def cmd_urgent(message: Message):
+    if not has_permission(message.from_user.id, "announce"):
+        await message.answer("Для термінових оголошень потрібне право <code>announce</code> 🔒")
+        return
+    group = await require_group(message)
+    if not group:
+        return
+    target_group, text = _announcement_target(message.text.partition(" ")[2], group)
+    if not text:
+        await message.answer("Приклад: <code>/urgent Пару перенесли в 312 аудиторію</code>")
+        return
+    # Термінові зміни доходять усім, навіть якщо звичайні оголошення вимкнені.
+    await broadcast_group(target_group, f"🚨 <b>Терміново</b>\n\n{html.escape(text)}")
+    await message.answer(f"Термінове повідомлення надіслано для {html.escape(target_group)} ✅")
+
+
+@dp.message(Command("material"))
+async def cmd_material(message: Message):
+    if not has_permission(message.from_user.id, "materials"):
+        await message.answer("Додавати матеріали може лише відповідальний із правом <code>materials</code> 🔒")
+        return
+    group = await require_group(message)
+    if not group:
+        return
+    parts = [p.strip() for p in message.text.partition(" ")[2].split("|")]
+    if len(parts) != 3 or not all(parts) or not re.match(r"https?://", parts[2], re.I):
+        await message.answer("Формат: <code>/material Предмет | Назва | https://посилання</code>")
+        return
+    db.add_material(group, parts[0], parts[1], parts[2], message.from_user.id)
+    await message.answer("Матеріал додано ✅")
+
+
+@dp.message(Command("materials"))
+async def cmd_materials(message: Message):
+    group = await require_group(message)
+    if group:
+        await message.answer(materials_text(group, message.text.partition(" ")[2].strip() or None), disable_web_page_preview=True)
+
+
+@dp.message(Command("poll"))
+async def cmd_poll(message: Message):
+    if not has_permission(message.from_user.id, "polls"):
+        await message.answer("Створювати опитування може лише відповідальний із правом <code>polls</code> 🔒")
+        return
+    group = await require_group(message)
+    if not group:
+        return
+    parts = [p.strip() for p in message.text.partition(" ")[2].split("|") if p.strip()]
+    if not 3 <= len(parts) <= 11:
+        await message.answer("Формат: <code>/poll Питання | Варіант 1 | Варіант 2 | ...</code>\nВід 2 до 10 варіантів.")
+        return
+    question, options = parts[0], parts[1:]
+    sent = 0
+    for chat_id in db.announcement_users_in_group(group):
+        try:
+            await bot.send_poll(chat_id, question, options, is_anonymous=False)
+            sent += 1
+        except Exception:
+            log.exception("Не вдалось надіслати опитування %s", chat_id)
+    await message.answer(f"Опитування надіслано: {sent} отримувачам ✅")
+
+
+@dp.message(Command("find"))
+async def cmd_find(message: Message):
+    query = message.text.partition(" ")[2].strip().lower()
+    if not query:
+        await message.answer("Приклад: <code>/find математика</code> або <code>/find Іваненко</code>")
+        return
+    group = await require_group(message)
+    if not group:
+        return
+    found = []
+    for offset in range(14):
+        d = today_kyiv() + timedelta(days=offset)
+        for lesson, _matches in lessons_for_date(group, d):
+            haystack = " ".join(str(lesson.get(k) or "") for k in ("subject", "teacher", "room")).lower()
+            if query in haystack:
+                found.append(f"• <b>{d.strftime('%d.%m')} ({DAY_NAMES[d.weekday()]})</b> {html.escape(lesson.get('time') or '')} — {html.escape(lesson.get('subject') or '')}")
+    if found:
+        await message.answer("🔎 <b>Найближчі збіги:</b>\n\n" + "\n".join(found[:20]))
+    else:
+        await message.answer("🔎 На найближчі 14 днів нічого не знайдено.")
 
 
 @dp.message(Command("notes"))
@@ -1098,6 +1337,47 @@ async def cb_toggle_reminders(callback: CallbackQuery):
     db.toggle_reminders(callback.from_user.id, not currently_on)
     await callback.message.edit_reply_markup(reply_markup=reminders_keyboard(callback.from_user.id))
     await callback.answer("Готово ✅")
+
+
+@dp.callback_query(F.data == "toggle_tomorrow")
+async def cb_toggle_tomorrow(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+    enabled = not (user and user["tomorrow_on"])
+    db.toggle_tomorrow(callback.from_user.id, enabled)
+    await callback.message.edit_reply_markup(reply_markup=reminders_keyboard(callback.from_user.id))
+    await callback.answer("Розклад на завтра увімкнено ✅" if enabled else "Розсилку на завтра вимкнено")
+
+
+@dp.callback_query(F.data == "toggle_announcements")
+async def cb_toggle_announcements(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+    enabled = not (user and user["announcements_on"])
+    db.toggle_announcements(callback.from_user.id, enabled)
+    await callback.message.edit_reply_markup(reply_markup=reminders_keyboard(callback.from_user.id))
+    await callback.answer("Оголошення увімкнено ✅" if enabled else "Звичайні оголошення вимкнено")
+
+
+def materials_text(group: str, query: str | None = None) -> str:
+    materials = db.materials_for_group(group, query)
+    if not materials:
+        return "📚 Матеріалів поки немає." if not query else "📚 За таким предметом матеріалів не знайдено."
+    lines = ["📚 <b>Матеріали групи:</b>\n"]
+    for item in materials:
+        lines.append(
+            f"• <b>{html.escape(item['subject'])}</b> — "
+            f"<a href=\"{html.escape(item['url'])}\">{html.escape(item['title'])}</a>"
+        )
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "materials_menu")
+async def cb_materials_menu(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text(materials_text(group), reply_markup=back_to_menu_keyboard(), disable_web_page_preview=True)
+    await callback.answer()
 
 
 async def _show_notes_lesson(target, chat_id: int, group: str, d: date, idx: int):
@@ -1302,6 +1582,23 @@ async def check_reminders():
                 user.get("group"),
             )
             errors += 1
+
+    # Вечірній розклад. Зовнішній cron викликає цей код щохвилини; ключ у
+    # sent_reminders гарантує, що кожен отримає лише одне повідомлення за вечір.
+    if now.hour == 20 and now.minute <= 10:
+        tomorrow = today + timedelta(days=1)
+        for user in db.tomorrow_users():
+            try:
+                if db.was_reminder_sent(user["chat_id"], "tomorrow_schedule", today.isoformat()):
+                    continue
+                text = "🌙 <b>Розклад на завтра</b>\n\n" + format_day_for_chat(
+                    user["chat_id"], user["group"], tomorrow
+                )
+                await bot.send_message(user["chat_id"], text)
+                db.mark_reminder_sent(user["chat_id"], "tomorrow_schedule", today.isoformat())
+            except Exception:
+                log.exception("Не вдалось надіслати розклад на завтра %s", user["chat_id"])
+                errors += 1
 
     _last_cron_run["at"] = now.isoformat()
     _last_cron_run["users_checked"] = users_checked
