@@ -1218,11 +1218,35 @@ async def note_text_received(message: Message, state: FSMContext):
 GRACE_MINUTES = 10
 
 
+# GitHub Actions на безкоштовних/публічних репо реально запускає schedule-cron
+# з інтервалами 10-13+ хв замість заданих 5 (документована особливість GH,
+# не помилка налаштування). Якщо ловити лише вузьке вікно (0; lead] хвилин
+# ДО пари, воно легко "провалюється" між двома запусками cron і нагадування
+# не надсилається взагалі. GRACE_MINUTES дозволяє долавити пари, момент
+# нагадування яких вже трохи минув, поки бот не встиг перевірити.
+GRACE_MINUTES = 10
+
+# Стан останнього запуску check_reminders() — читається через GET /cron-status,
+# щоб можна було в браузері перевірити, чи зовнішній пінгер (cron-job.org,
+# GitHub Actions тощо) реально стукає в /cron, не копаючись у логах Render.
+_last_cron_run: dict = {
+    "at": None,          # ISO-час останнього виклику /cron (Kyiv)
+    "users_checked": 0,
+    "reminders_sent": 0,
+    "errors": 0,
+}
+
+
 async def check_reminders():
     now = now_kyiv()
     today = now.date()
 
+    users_checked = 0
+    reminders_sent = 0
+    errors = 0
+
     for user in db.all_users():
+        users_checked += 1
         # КРИТИЧНО: кожен користувач обробляється в своєму try/except.
         # Раніше виняток у build_day_entries() (погані дані в overrides,
         # збій зв'язку з Turso тощо) для ОДНОГО користувача обривав увесь
@@ -1254,8 +1278,10 @@ async def check_reminders():
                     )
                 try:
                     await bot.send_message(user["chat_id"], text)
+                    reminders_sent += 1
                 except Exception:
                     log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
+                    errors += 1
                 db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
         except Exception:
             log.exception(
@@ -1263,6 +1289,14 @@ async def check_reminders():
                 user.get("chat_id"),
                 user.get("group"),
             )
+            errors += 1
+
+    _last_cron_run["at"] = now.isoformat()
+    _last_cron_run["users_checked"] = users_checked
+    _last_cron_run["reminders_sent"] = reminders_sent
+    _last_cron_run["errors"] = errors
+
+
 
 
 # --------------------------------------------------------------------- HTTP
@@ -1276,6 +1310,24 @@ async def cron_handler(request: web.Request):
 
 async def health_handler(request: web.Request):
     return web.Response(text="ok")
+
+
+async def cron_status_handler(request: web.Request):
+    """Швидка перевірка, чи зовнішній пінгер (cron-job.org, GitHub Actions
+    тощо) реально стукає в /cron. Відкрий у браузері:
+    https://твій-бот.onrender.com/cron-status
+    Секрет тут не потрібен — дані не чутливі (лише час і лічильники)."""
+    info = dict(_last_cron_run)
+    if info["at"]:
+        last_dt = datetime.fromisoformat(info["at"])
+        minutes_ago = round((now_kyiv() - last_dt).total_seconds() / 60, 1)
+        info["minutes_since_last_run"] = minutes_ago
+        info["looks_healthy"] = minutes_ago < 15  # має бути значно частіше
+    else:
+        info["minutes_since_last_run"] = None
+        info["looks_healthy"] = False
+        info["note"] = "check_reminders() ще жодного разу не викликався з моменту старту сервісу"
+    return web.json_response(info)
 
 
 async def on_startup(app: web.Application):
@@ -1301,6 +1353,7 @@ def main():
     SimpleRequestHandler(dispatcher=dp, bot=bot, secret_token=WEBHOOK_SECRET).register(app, path=WEBHOOK_PATH)
     setup_application(app, dp, bot=bot)
     app.router.add_get("/cron", cron_handler)
+    app.router.add_get("/cron-status", cron_status_handler)
     app.router.add_get("/", health_handler)
 
     web.run_app(app, host="0.0.0.0", port=PORT)
