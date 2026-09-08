@@ -25,6 +25,7 @@ bot.py — Telegram-бот "розклад на день" для ВСІЄЇ гр
 
 import asyncio
 import html
+import io
 import logging
 import os
 import re
@@ -46,6 +47,7 @@ from aiogram.types import (
 )
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+from openpyxl import load_workbook
 
 import db
 from schedule_data import (
@@ -108,6 +110,12 @@ class IndividualState(StatesGroup):
     waiting_value = State()
 
 
+class ImportScheduleState(StatesGroup):
+    waiting_file = State()
+    waiting_surname = State()
+    waiting_confirmation = State()
+
+
 CHANGE_FIELDS = [
     ("subject", "нову назву предмета"),
     ("time", "новий час (напр. «14:10 - 15:30»)"),
@@ -135,6 +143,15 @@ IND_PROMPTS = {
     "room": "Аудиторія чи посилання? (або «-»):",
 }
 
+WEEKDAY_ALIASES = {
+    "понед": "Понеділок", "вівтор": "Вівторок", "серед": "Середа", "четвер": "Четвер",
+    "п'ят": "П'ятниця", "пят": "П'ятниця", "субот": "Субота", "неділ": "Неділя",
+    "monday": "Понеділок", "tuesday": "Вівторок", "wednesday": "Середа", "thursday": "Четвер",
+    "friday": "П'ятниця", "saturday": "Субота", "sunday": "Неділя",
+}
+IMPORT_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b")
+IMPORT_DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b")
+
 
 IMPORTANT_TYPES = {"пр", "сем", "контр", "мк"}  # практичне, семінар, контрольний захід, модульний контроль
 
@@ -150,6 +167,107 @@ def today_kyiv() -> date:
 
 def now_kyiv() -> datetime:
     return datetime.now(KYIV_TZ)
+
+
+def _normalized(value: object) -> str:
+    return re.sub(r"[^a-zа-яіїєґ0-9]+", "", str(value or "").lower())
+
+
+def _weekday_in(value: object) -> str | None:
+    text = str(value or "").lower().replace("’", "'")
+    return next((weekday for alias, weekday in WEEKDAY_ALIASES.items() if alias in text), None)
+
+
+def _date_in(value: object) -> str | None:
+    text = str(value or "")
+    iso = re.search(r"\b\d{4}-(\d{1,2})-(\d{1,2})\b", text)
+    match = iso or IMPORT_DATE_RE.search(text)
+    if not match:
+        return None
+    if iso:
+        month, day = iso.groups()
+    else:
+        day, month = match.group(0).replace("/", ".").replace("-", ".").split(".")[:2]
+    return f"{int(day):02d}.{int(month):02d}"
+
+
+def _import_schedule_from_excel(data: bytes, surname: str) -> list[dict]:
+    """Витягує рядки поруч із прізвищем із довільної таблиці Excel.
+
+    Розклади закладів різняться, тому результат завжди показується студенту
+    перед збереженням. Це запобігає тихому додаванню помилкових пар.
+    """
+    needle = _normalized(surname)
+    if len(needle) < 2:
+        return []
+    book = load_workbook(io.BytesIO(data), read_only=True, data_only=True)
+    found: list[dict] = []
+    seen = set()
+    for sheet in book.worksheets:
+        rows = [list(row) for row in sheet.iter_rows(values_only=True)]
+        for row_index, row in enumerate(rows):
+            name_columns = [column for column, cell in enumerate(row) if needle in _normalized(cell)]
+            if not name_columns:
+                continue
+            row_text = [str(cell).strip() for cell in row if cell is not None and str(cell).strip()]
+            time = next((match.group(0).replace(".", ":") for cell in row_text for match in [IMPORT_TIME_RE.search(cell)] if match), None)
+            weekday = next((value for cell in row_text if (value := _weekday_in(cell))), None)
+            date_value = next((date_value for cell in row_text if (date_value := _date_in(cell))), None)
+            # Заголовки дня/часу часто знаходяться над рядком студента.
+            for above in range(max(0, row_index - 8), row_index):
+                header_cells = [str(cell).strip() for cell in rows[above] if cell is not None]
+                if not weekday:
+                    weekday = next((value for cell in header_cells if (value := _weekday_in(cell))), None)
+                if not date_value:
+                    date_value = next((date_value for cell in header_cells if (date_value := _date_in(cell))), None)
+                if not time:
+                    time = next((match.group(0).replace(".", ":") for cell in header_cells for match in [IMPORT_TIME_RE.search(cell)] if match), None)
+            if not time:
+                continue
+            ignored = {needle, _normalized(time), _normalized(weekday), _normalized(date_value)}
+            candidates = [cell for cell in row_text if len(_normalized(cell)) > 2 and _normalized(cell) not in ignored and needle not in _normalized(cell) and not IMPORT_TIME_RE.search(cell)]
+            subject = candidates[0] if candidates else "Індивідуальне заняття"
+            key = (weekday, date_value, time, subject)
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append({"weekday": weekday, "date": date_value, "time": time, "subject": subject})
+
+            # Інший поширений формат: прізвище є заголовком колонки, а його
+            # заняття записані нижче. Перевіряємо цю колонку окремо.
+            for column in name_columns:
+                empty_rows = 0
+                for below_index in range(row_index + 1, min(len(rows), row_index + 41)):
+                    cell = rows[below_index][column] if column < len(rows[below_index]) else None
+                    subject_below = str(cell or "").strip()
+                    if not subject_below:
+                        empty_rows += 1
+                        if empty_rows >= 5:
+                            break
+                        continue
+                    empty_rows = 0
+                    if needle in _normalized(subject_below) or IMPORT_TIME_RE.search(subject_below):
+                        continue
+                    below_text = [str(value).strip() for value in rows[below_index] if value is not None]
+                    time_below = next((match.group(0).replace(".", ":") for value in below_text for match in [IMPORT_TIME_RE.search(value)] if match), None)
+                    weekday_below = next((weekday for cell_text in below_text if (weekday := _weekday_in(cell_text))), None)
+                    date_below = next((date_value for cell_text in below_text if (date_value := _date_in(cell_text))), None)
+                    for header_index in range(max(0, below_index - 8), below_index):
+                        header = [str(value).strip() for value in rows[header_index] if value is not None]
+                        if not weekday_below:
+                            weekday_below = next((weekday for cell_text in header if (weekday := _weekday_in(cell_text))), None)
+                        if not date_below:
+                            date_below = next((date_value for cell_text in header if (date_value := _date_in(cell_text))), None)
+                        if not time_below:
+                            time_below = next((match.group(0).replace(".", ":") for value in header for match in [IMPORT_TIME_RE.search(value)] if match), None)
+                    if not time_below:
+                        continue
+                    key = (weekday_below, date_below, time_below, subject_below)
+                    if key not in seen:
+                        seen.add(key)
+                        found.append({"weekday": weekday_below, "date": date_below, "time": time_below, "subject": subject_below})
+    book.close()
+    return found
 
 
 # ---------------------------------------------------------------- рендеринг
@@ -505,13 +623,15 @@ def individual_menu_text() -> str:
     return (
         "🎓 <b>Індивідуальні заняття</b>\n\n"
         "Тут можна додати власні заняття (інструмент, вокал тощо), які бачиш "
-        "тільки ти — вони з'являться в твоєму розкладі дня поруч із парами групи."
+        "тільки ти — вони з'являться в твоєму розкладі дня поруч із парами групи.\n\n"
+        "Можна також завантажити Excel-розклад і знайти себе за прізвищем."
     )
 
 
 def individual_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="➕ Додати заняття", callback_data="ind_add")],
+        [InlineKeyboardButton(text="📥 Додати файл Excel", callback_data="ind_import")],
         [InlineKeyboardButton(text="👀 Мої заняття", callback_data="ind_view")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
     ]
@@ -941,6 +1061,96 @@ async def cb_ind_add(callback: CallbackQuery, state: FSMContext):
     await state.update_data(field_idx=0, values={})
     await state.set_state(IndividualState.waiting_value)
     await callback.message.answer(IND_PROMPTS["subject"])
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ind_import")
+async def cb_ind_import(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(ImportScheduleState.waiting_file)
+    await callback.message.answer("Надішли Excel-файл розкладу у форматі .xlsx (до 5 МБ).")
+    await callback.answer()
+
+
+@dp.message(StateFilter(ImportScheduleState.waiting_file), F.document)
+async def individual_import_file(message: Message, state: FSMContext):
+    document = message.document
+    filename = (document.file_name or "").lower()
+    if not filename.endswith(".xlsx"):
+        await message.answer("Поки підтримується лише файл .xlsx. В Excel: «Зберегти як» → Excel Workbook (.xlsx).")
+        return
+    if document.file_size and document.file_size > 5 * 1024 * 1024:
+        await message.answer("Файл завеликий. Надішли Excel до 5 МБ.")
+        return
+    try:
+        downloaded = await bot.download(document)
+        data = downloaded.read()
+    except Exception:
+        log.exception("Не вдалось завантажити Excel-файл")
+        await message.answer("Не зміг завантажити файл. Спробуй ще раз.")
+        return
+    await state.update_data(excel_data=data, excel_name=document.file_name)
+    await state.set_state(ImportScheduleState.waiting_surname)
+    await message.answer("Тепер напиши своє прізвище так, як воно записане в таблиці.")
+
+
+@dp.message(StateFilter(ImportScheduleState.waiting_file))
+async def individual_import_waiting_file(message: Message):
+    await message.answer("Надішли саме Excel-файл .xlsx або натисни /start, щоб скасувати.")
+
+
+@dp.message(StateFilter(ImportScheduleState.waiting_surname))
+async def individual_import_surname(message: Message, state: FSMContext):
+    data = await state.get_data()
+    try:
+        lessons = _import_schedule_from_excel(data["excel_data"], message.text.strip())
+    except Exception:
+        log.exception("Не вдалось прочитати Excel-файл індивідуального розкладу")
+        await state.clear()
+        await message.answer("Не зміг прочитати цей файл. Переконайся, що це справжній .xlsx, і спробуй ще раз.")
+        return
+    if not lessons:
+        await message.answer(
+            "Не знайшов занять із цим прізвищем або не зміг розпізнати час. "
+            "Спробуй інше написання прізвища."
+        )
+        return
+    await state.update_data(imported_lessons=lessons)
+    await state.set_state(ImportScheduleState.waiting_confirmation)
+    lines = ["📥 <b>Знайдено такі заняття:</b>"]
+    for lesson in lessons[:30]:
+        when = lesson.get("weekday") or lesson.get("date") or "день не визначено"
+        lines.append(f"• {html.escape(when)}, {html.escape(lesson['time'])} — {html.escape(lesson['subject'])}")
+    if len(lessons) > 30:
+        lines.append(f"… і ще {len(lessons) - 30}")
+    lines.append("\nПідтвердити імпорт?")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Зберегти в мій розклад", callback_data="ind_import_confirm")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="ind_import_cancel")],
+    ])
+    await message.answer("\n".join(lines), reply_markup=keyboard)
+
+
+@dp.callback_query(F.data == "ind_import_confirm")
+async def cb_ind_import_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    lessons = data.get("imported_lessons")
+    if not lessons:
+        await callback.answer("Імпорт уже завершився або скасований. Спробуй ще раз.", show_alert=True)
+        return
+    db.replace_imported_individual_lessons(callback.from_user.id, lessons)
+    await state.clear()
+    await callback.message.edit_text(
+        f"Збережено {len(lessons)} занять ✅\nВони показуватимуться лише у твоєму розкладі.",
+        reply_markup=individual_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "ind_import_cancel")
+async def cb_ind_import_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Імпорт скасовано.", reply_markup=individual_menu_keyboard())
     await callback.answer()
 
 
