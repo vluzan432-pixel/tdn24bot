@@ -82,6 +82,7 @@ CREATE TABLE IF NOT EXISTS individual_lessons (
     teacher TEXT,
     room TEXT,
     note TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',
     created_at TEXT NOT NULL
 );
 
@@ -148,6 +149,10 @@ def init_db():
             conn.execute(f"ALTER TABLE users ADD COLUMN {column}")
         except Exception:
             pass  # Стовпець уже існує.
+    try:
+        conn.execute("ALTER TABLE individual_lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
+    except Exception:
+        pass  # Стовпець уже існує.
     conn.commit()
     conn.close()
 
@@ -487,13 +492,14 @@ def add_individual_lesson(
     teacher: str | None = None,
     room: str | None = None,
     note: str | None = None,
+    source: str = "manual",
 ):
     conn = _connect()
     conn.execute(
         "INSERT INTO individual_lessons "
-        "(chat_id, weekday, date, time, subject, teacher, room, note, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (chat_id, weekday, date, time, subject, teacher, room, note, _today_kyiv().isoformat()),
+        "(chat_id, weekday, date, time, subject, teacher, room, note, source, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, weekday, date, time, subject, teacher, room, note, source, _today_kyiv().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -502,29 +508,47 @@ def add_individual_lesson(
 def individual_lessons_for(chat_id: int, weekday: str, date_str: str):
     conn = _connect()
     rows = conn.execute(
-        "SELECT id, weekday, date, time, subject, teacher, room, note "
+        "SELECT id, weekday, date, time, subject, teacher, room, note, source "
         "FROM individual_lessons WHERE chat_id = ? AND (weekday = ? OR date = ?)",
         (chat_id, weekday, date_str),
     ).fetchall()
     conn.close()
-    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note"]
+    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note", "source"]
     return [dict(zip(cols, r)) for r in rows]
 
 
 def all_individual_lessons(chat_id: int):
     conn = _connect()
     rows = conn.execute(
-        "SELECT id, weekday, date, time, subject, teacher, room, note "
+        "SELECT id, weekday, date, time, subject, teacher, room, note, source "
         "FROM individual_lessons WHERE chat_id = ? ORDER BY id",
         (chat_id,),
     ).fetchall()
     conn.close()
-    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note"]
+    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note", "source"]
     return [dict(zip(cols, r)) for r in rows]
 
 
 def delete_individual_lesson(chat_id: int, lesson_id: int):
     conn = _connect()
     conn.execute("DELETE FROM individual_lessons WHERE chat_id = ? AND id = ?", (chat_id, lesson_id))
+    conn.commit()
+    conn.close()
+
+
+def replace_imported_individual_lessons(chat_id: int, lessons: list[dict]):
+    """Оновлює лише заняття, створені імпортом Excel. Ручні записи лишаються."""
+    conn = _connect()
+    conn.execute("DELETE FROM individual_lessons WHERE chat_id = ? AND source = 'import'", (chat_id,))
+    for lesson in lessons:
+        conn.execute(
+            "INSERT INTO individual_lessons "
+            "(chat_id, weekday, date, time, subject, teacher, room, note, source, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'import', ?)",
+            (
+                chat_id, lesson.get("weekday"), lesson.get("date"), lesson["time"], lesson["subject"],
+                lesson.get("teacher"), lesson.get("room"), lesson.get("note"), _today_kyiv().isoformat(),
+            ),
+        )
     conn.commit()
     conn.close()
