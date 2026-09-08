@@ -245,11 +245,24 @@ def group_choice_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def main_menu_text(group: str) -> str:
+    return (
+        f"🎓 <b>{html.escape(group)}</b>\n"
+        "Обери розділ:\n\n"
+        "📅 <b>Розклад пар</b> — заняття на день, гортання по датах\n"
+        "🗓 <b>Найближчі сем./практ./контролі</b> — важливе на тиждень наперед\n"
+        "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад\n"
+        "✏️ <b>Редагувати розклад</b> — виправити пару, якщо її перенесли\n"
+        "👥 <b>Вибір групи</b> — змінити групу"
+    )
+
+
 def main_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
         [InlineKeyboardButton(text="🗓 Найближчі сем./практ./контролі", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
+        [InlineKeyboardButton(text="✏️ Редагувати розклад", callback_data="edit_menu")],
         [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -264,6 +277,15 @@ def individual_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📤 Завантажити файл", callback_data="individual_upload")],
         [InlineKeyboardButton(text="👀 Переглянути свої", callback_data="individual_view")],
         [InlineKeyboardButton(text="🗑 Видалити", callback_data="individual_delete")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def edit_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📋 Загальний (уся група)", callback_data="edit_scope:group")],
+        [InlineKeyboardButton(text="👤 Індивідуальний (тільки я)", callback_data="edit_scope:personal")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -303,7 +325,7 @@ async def cmd_start(message: Message):
     group = await require_group(message)
     if not group:
         return
-    await message.answer("Що показати?", reply_markup=main_menu_keyboard())
+    await message.answer(main_menu_text(group), reply_markup=main_menu_keyboard())
 
 
 @dp.callback_query(F.data == "main_menu")
@@ -312,7 +334,7 @@ async def cb_main_menu(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text("Що показати?", reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(main_menu_text(group), reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
@@ -320,6 +342,21 @@ async def cb_main_menu(callback: CallbackQuery):
 async def cb_choose_group(callback: CallbackQuery):
     await callback.message.edit_text("Обери свою групу:", reply_markup=group_choice_keyboard())
     await callback.answer()
+
+
+@dp.callback_query(F.data == "edit_menu")
+async def cb_edit_menu(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text("✏️ Який розклад редагувати?", reply_markup=edit_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("edit_scope:"))
+async def cb_edit_scope(callback: CallbackQuery):
+    await callback.answer("Цей розділ ще проєктується 🚧", show_alert=True)
 
 
 @dp.callback_query(F.data == "upcoming")
@@ -383,7 +420,7 @@ async def cmd_delnote(message: Message):
 async def cb_setgroup(callback: CallbackQuery):
     group = callback.data.split(":", 1)[1]
     db.set_group(callback.from_user.id, group)
-    await callback.message.edit_text(f"Група {html.escape(group)} збережена ✅\n\nЩо показати?", reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(f"Група {html.escape(group)} збережена ✅\n\n" + main_menu_text(group), reply_markup=main_menu_keyboard())
     await callback.answer()
 
 
