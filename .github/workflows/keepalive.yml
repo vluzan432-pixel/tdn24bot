@@ -1,0 +1,17 @@
+name: keep-alive-and-reminders
+
+on:
+  schedule:
+    # Мінімальний інтервал у GitHub Actions — 5 хв. Реальні запуски можуть
+    # запізнюватись на кілька хвилин у пікові періоди — це нормально,
+    # запізнення терпиме для нагадувань за 15-30 хв наперед.
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping /cron endpoint
+        run: |
+          curl -fsS --max-time 60 "${{ secrets.BOT_CRON_URL }}" || echo "Пінг не вдався (можливо бот саме прокидається) — це ок, спробуємо через 5 хв"
