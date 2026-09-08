@@ -55,10 +55,12 @@ from schedule_data import (
     DAY_NAMES,
     GROUPS,
     TIME_START_RE,
+    classify_type,
     find_zoom,
     lesson_key,
     lesson_start_time,
     lessons_for_date,
+    subject_has_lectures,
     type_label,
 )
 
@@ -154,7 +156,7 @@ IMPORT_TIME_RE = re.compile(r"\b([01]?\d|2[0-3])[:.]([0-5]\d)\b")
 IMPORT_DATE_RE = re.compile(r"\b\d{1,2}[./-]\d{1,2}(?:[./-]\d{2,4})?\b")
 
 
-IMPORTANT_TYPES = {"пр", "сем", "контр", "мк"}  # практичне, семінар, контрольний захід, модульний контроль
+IMPORTANT_TYPES = {"пр", "сем", "пк"}  # практичне, семінар, проміжний контроль — інших типів немає в цьому розкладі
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
@@ -571,8 +573,12 @@ def upcoming_important_text(group: str, week_offset: int = 0) -> str:
         items = []
         for lesson, matches in lessons_for_date(group, d):
             for m in matches:
-                type_key = m["type"].strip().lower().rstrip(".")
+                type_key = classify_type(m["type"])
                 if type_key not in IMPORTANT_TYPES:
+                    continue
+                if type_key == "пр" and not subject_has_lectures(group, lesson.get("subject")):
+                    # Суто практичний предмет (лекцій за ним немає взагалі) —
+                    # його щотижневі практичні це рутина, а не "важлива подія".
                     continue
                 label, emoji = type_label(m["type"])
                 pk_suffix = " ⚠️ <b>ПК</b>" if m["pk"] else ""
