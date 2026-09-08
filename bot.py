@@ -24,6 +24,7 @@ bot.py — Telegram-бот "розклад на день" для ВСІЄЇ гр
 """
 
 import asyncio
+import calendar as calendar_module
 import html
 import io
 import logging
@@ -538,27 +539,115 @@ async def _broadcast_to(chat_ids: list[int], text: str):
     await asyncio.gather(*(send(chat_id) for chat_id in chat_ids))
 
 
-def upcoming_important_text(group: str) -> str:
+MAX_UPCOMING_WEEKS = 8  # не даємо гортати роками наперед — розклад так далеко не сягає
+
+DAY_SHORT = {
+    "Понеділок": "Пн", "Вівторок": "Вт", "Середа": "Ср", "Четвер": "Чт",
+    "П'ятниця": "Пт", "Субота": "Сб", "Неділя": "Нд",
+}
+
+
+def upcoming_important_text(group: str, week_offset: int = 0) -> str:
     today = today_kyiv()
-    lines = []
+    start = today + timedelta(days=7 * week_offset)
+    end = start + timedelta(days=6)
+    period = f"{start.strftime('%d.%m')}–{end.strftime('%d.%m')}"
+
+    if week_offset == 0:
+        header = f"🗓 <b>Найближчий тиждень</b> · {period}"
+    else:
+        header = f"🗓 <b>Тиждень +{week_offset}</b> · {period}"
+
+    day_blocks = []
     for offset in range(7):
-        d = today + timedelta(days=offset)
+        d = start + timedelta(days=offset)
         day_name = DAY_NAMES[d.weekday()]
+        items = []
         for lesson, matches in lessons_for_date(group, d):
             for m in matches:
                 type_key = m["type"].strip().lower().rstrip(".")
                 if type_key not in IMPORTANT_TYPES:
                     continue
                 label, emoji = type_label(m["type"])
-                pk_suffix = " ⚠️ ПК" if m["pk"] else ""
+                pk_suffix = " ⚠️ <b>ПК</b>" if m["pk"] else ""
                 subject = html.escape(lesson.get("subject") or "")
-                lines.append(
-                    f"{emoji} <b>{d.strftime('%d.%m')} ({day_name})</b> {html.escape(lesson.get('time', ''))} "
-                    f"— {subject} · {label}{pk_suffix}"
-                )
-    if not lines:
-        return "🗓 На найближчий тиждень семінарів/практичних/контролів не знайдено 🎉"
-    return "🗓 <b>Найближчі семінари / практичні / контролі (7 днів):</b>\n\n" + "\n".join(lines)
+                time_ = html.escape(lesson.get("time", ""))
+                items.append(f"    {emoji} <code>{time_}</code>  {subject} · {label}{pk_suffix}")
+        if items:
+            today_mark = " 👈" if d == today else ""
+            day_blocks.append(
+                f"<b>{DAY_SHORT.get(day_name, day_name)}, {d.strftime('%d.%m')}</b>{today_mark}\n" + "\n".join(items)
+            )
+
+    if not day_blocks:
+        body = "На цей тиждень нічого важливого не заплановано 🎉"
+    else:
+        body = "\n\n".join(day_blocks)
+
+    return f"{header}\n{'─' * 18}\n\n{body}"
+
+
+def upcoming_keyboard(week_offset: int) -> InlineKeyboardMarkup:
+    nav_row = []
+    if week_offset > 0:
+        nav_row.append(InlineKeyboardButton(text="◀ Тиждень назад", callback_data=f"upcoming:{week_offset - 1}"))
+    if week_offset < MAX_UPCOMING_WEEKS:
+        nav_row.append(InlineKeyboardButton(text="Тиждень вперед ▶", callback_data=f"upcoming:{week_offset + 1}"))
+    rows = [nav_row] if nav_row else []
+    if week_offset != 0:
+        rows.append([InlineKeyboardButton(text="📍 На цей тиждень", callback_data="upcoming:0")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+MONTH_NAMES_UA = [
+    "", "Січень", "Лютий", "Березень", "Квітень", "Травень", "Червень",
+    "Липень", "Серпень", "Вересень", "Жовтень", "Листопад", "Грудень",
+]
+MIN_CALENDAR_MONTH_OFFSET = -1  # можна глянути один місяць назад
+MAX_CALENDAR_MONTH_OFFSET = 4   # і на 4 місяці наперед — цього вистачає на семестр
+
+
+def _add_months(d: date, months: int) -> date:
+    total = d.month - 1 + months
+    year = d.year + total // 12
+    month = total % 12 + 1
+    return date(year, month, 1)
+
+
+def calendar_keyboard(year: int, month: int) -> InlineKeyboardMarkup:
+    today = today_kyiv()
+    first_of_target = date(year, month, 1)
+    first_of_current = date(today.year, today.month, 1)
+    offset_months = (first_of_target.year - first_of_current.year) * 12 + (first_of_target.month - first_of_current.month)
+
+    weeks = calendar_module.Calendar(firstweekday=0).monthdatescalendar(year, month)
+
+    rows = [[InlineKeyboardButton(text=d, callback_data="noop") for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]]]
+    for week in weeks:
+        row = []
+        for day_date in week:
+            if day_date.month != month:
+                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+            else:
+                label = f"·{day_date.day}·" if day_date == today else str(day_date.day)
+                row.append(InlineKeyboardButton(text=label, callback_data=f"day:{day_date.isoformat()}"))
+        rows.append(row)
+
+    nav_row = []
+    if offset_months > MIN_CALENDAR_MONTH_OFFSET:
+        prev_m = _add_months(first_of_target, -1)
+        nav_row.append(InlineKeyboardButton(text="◀", callback_data=f"calendar:{prev_m.year}-{prev_m.month:02d}"))
+    nav_row.append(
+        InlineKeyboardButton(text=f"{MONTH_NAMES_UA[month]} {year}", callback_data="noop")
+    )
+    if offset_months < MAX_CALENDAR_MONTH_OFFSET:
+        next_m = _add_months(first_of_target, 1)
+        nav_row.append(InlineKeyboardButton(text="▶", callback_data=f"calendar:{next_m.year}-{next_m.month:02d}"))
+    rows.append(nav_row)
+    rows.append([InlineKeyboardButton(text="📅 На сьогодні", callback_data="today")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def keyboard_for_day(chat_id: int, group: str, d: date, entries: list | None = None) -> InlineKeyboardMarkup:
@@ -569,7 +658,10 @@ def keyboard_for_day(chat_id: int, group: str, d: date, entries: list | None = N
             InlineKeyboardButton(text="◀ Назад", callback_data=f"day:{prev_day}"),
             InlineKeyboardButton(text="Вперед ▶", callback_data=f"day:{next_day}"),
         ],
-        [InlineKeyboardButton(text="📅 На сьогодні", callback_data="today")],
+        [
+            InlineKeyboardButton(text="📅 На сьогодні", callback_data="today"),
+            InlineKeyboardButton(text="📆 Календар", callback_data=f"calendar:{d.year}-{d.month:02d}"),
+        ],
     ]
 
     if entries is None:
@@ -580,7 +672,6 @@ def keyboard_for_day(chat_id: int, group: str, d: date, entries: list | None = N
     if entries:
         rows.append([InlineKeyboardButton(text="📝 Нотатки", callback_data=f"notes_menu:{d.isoformat()}")])
 
-    rows.append([InlineKeyboardButton(text="🔔 Нагадування", callback_data="reminders_menu")])
     rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1109,7 +1200,20 @@ async def cb_upcoming(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text(upcoming_important_text(group), reply_markup=back_to_menu_keyboard())
+    await callback.message.edit_text(upcoming_important_text(group, 0), reply_markup=upcoming_keyboard(0))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("upcoming:"))
+async def cb_upcoming_week(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    week_offset = max(0, min(MAX_UPCOMING_WEEKS, int(callback.data.split(":", 1)[1])))
+    await callback.message.edit_text(
+        upcoming_important_text(group, week_offset), reply_markup=upcoming_keyboard(week_offset)
+    )
     await callback.answer()
 
 
@@ -1565,6 +1669,23 @@ async def cb_today(callback: CallbackQuery):
     await callback.answer()
 
 
+@dp.callback_query(F.data == "noop")
+async def cb_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("calendar:"))
+async def cb_calendar(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    year_str, month_str = callback.data.split(":", 1)[1].split("-")
+    year, month = int(year_str), int(month_str)
+    await callback.message.edit_text("📆 Обери дату:", reply_markup=calendar_keyboard(year, month))
+    await callback.answer()
+
+
 @dp.callback_query(F.data.startswith("day:"))
 async def cb_day(callback: CallbackQuery):
     group = await require_group(callback)
@@ -1621,18 +1742,6 @@ async def cb_zoom_info(callback: CallbackQuery):
         f"🔑 Код доступу: <code>{html.escape(info['passcode'])}</code>"
     )
     await callback.message.edit_text(text, reply_markup=zoom_info_keyboard(d), disable_web_page_preview=True)
-    await callback.answer()
-
-
-@dp.callback_query(F.data == "reminders_menu")
-async def cb_reminders_menu(callback: CallbackQuery):
-    user = db.get_user(callback.from_user.id)
-    status = "увімкнені 🔔" if (not user or user["reminders_on"]) else "вимкнені 🔕"
-    minutes = user["reminder_minutes"] if user else 15
-    await callback.message.edit_text(
-        f"Нагадування зараз {status}, за {minutes} хв до пари.\nОбери інтервал або вимкни:",
-        reply_markup=reminders_keyboard(callback.from_user.id),
-    )
     await callback.answer()
 
 
