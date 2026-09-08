@@ -25,6 +25,12 @@ TURSO_URL = os.environ.get("TURSO_DATABASE_URL")
 TURSO_TOKEN = os.environ.get("TURSO_AUTH_TOKEN")
 LOCAL_DB_PATH = os.environ.get("DB_PATH", "bot.db")
 
+# Кожне нове підключення до Turso — це мережевий запит. До оптимізації одна
+# дія в Telegram могла створити 5–10 таких підключень, що особливо боляче на
+# безкоштовному Render. Один процес бота обробляє ці синхронні операції
+# послідовно, тож з'єднання можна безпечно перевикористовувати.
+_REMOTE_CONNECTION = None
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users (
     chat_id INTEGER PRIMARY KEY,
@@ -88,9 +94,26 @@ def _today_kyiv() -> date:
     return datetime.now(KYIV_TZ).date()
 
 
+class _SharedRemoteConnection:
+    """Обгортка: старий код може викликати close(), але спільний канал Turso
+    лишається відкритим для наступного запиту."""
+
+    def __init__(self, connection):
+        self._connection = connection
+
+    def close(self):
+        pass
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
 def _connect():
+    global _REMOTE_CONNECTION
     if TURSO_URL:
-        return libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+        if _REMOTE_CONNECTION is None:
+            _REMOTE_CONNECTION = libsql.connect(database=TURSO_URL, auth_token=TURSO_TOKEN)
+        return _SharedRemoteConnection(_REMOTE_CONNECTION)
     return libsql.connect(LOCAL_DB_PATH)
 
 
