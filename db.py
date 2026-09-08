@@ -84,6 +84,23 @@ CREATE TABLE IF NOT EXISTS individual_lessons (
     note TEXT,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS staff_permissions (
+    chat_id INTEGER PRIMARY KEY,
+    permissions TEXT NOT NULL,
+    granted_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS materials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -122,6 +139,15 @@ def init_db():
     for statement in SCHEMA.strip().split(";\n\n"):
         if statement.strip():
             conn.execute(statement)
+    # Безпечна міграція для вже створених баз.
+    for column in (
+        "tomorrow_on INTEGER NOT NULL DEFAULT 0",
+        "announcements_on INTEGER NOT NULL DEFAULT 1",
+    ):
+        try:
+            conn.execute(f"ALTER TABLE users ADD COLUMN {column}")
+        except Exception:
+            pass  # Стовпець уже існує.
     conn.commit()
     conn.close()
 
@@ -140,13 +166,17 @@ def set_group(chat_id: int, group_name: str):
 def get_user(chat_id: int):
     conn = _connect()
     row = conn.execute(
-        "SELECT chat_id, group_name, reminder_minutes, reminders_on FROM users WHERE chat_id = ?",
+        "SELECT chat_id, group_name, reminder_minutes, reminders_on, tomorrow_on, announcements_on "
+        "FROM users WHERE chat_id = ?",
         (chat_id,),
     ).fetchone()
     conn.close()
     if not row:
         return None
-    return {"chat_id": row[0], "group": row[1], "reminder_minutes": row[2], "reminders_on": bool(row[3])}
+    return {
+        "chat_id": row[0], "group": row[1], "reminder_minutes": row[2], "reminders_on": bool(row[3]),
+        "tomorrow_on": bool(row[4]), "announcements_on": bool(row[5]),
+    }
 
 
 def all_users():
@@ -168,6 +198,20 @@ def set_reminder_minutes(chat_id: int, minutes: int):
 def toggle_reminders(chat_id: int, on: bool):
     conn = _connect()
     conn.execute("UPDATE users SET reminders_on = ? WHERE chat_id = ?", (1 if on else 0, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def toggle_tomorrow(chat_id: int, on: bool):
+    conn = _connect()
+    conn.execute("UPDATE users SET tomorrow_on = ? WHERE chat_id = ?", (1 if on else 0, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def toggle_announcements(chat_id: int, on: bool):
+    conn = _connect()
+    conn.execute("UPDATE users SET announcements_on = ? WHERE chat_id = ?", (1 if on else 0, chat_id))
     conn.commit()
     conn.close()
 
@@ -282,6 +326,90 @@ def users_in_group(group_name: str):
     rows = conn.execute("SELECT chat_id FROM users WHERE group_name = ?", (group_name,)).fetchall()
     conn.close()
     return [r[0] for r in rows]
+
+
+def announcement_users_in_group(group_name: str):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT chat_id FROM users WHERE group_name = ? AND announcements_on = 1", (group_name,)
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def tomorrow_users():
+    conn = _connect()
+    rows = conn.execute("SELECT chat_id, group_name FROM users WHERE tomorrow_on = 1").fetchall()
+    conn.close()
+    return [{"chat_id": r[0], "group": r[1]} for r in rows]
+
+
+# -------------------------------------------------------------- права / матеріали
+
+
+def set_staff_permissions(chat_id: int, permissions: set[str], granted_by: int):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO staff_permissions (chat_id, permissions, granted_by, created_at) VALUES (?, ?, ?, ?) "
+        "ON CONFLICT(chat_id) DO UPDATE SET permissions = excluded.permissions, granted_by = excluded.granted_by, "
+        "created_at = excluded.created_at",
+        (chat_id, ",".join(sorted(permissions)), granted_by, _today_kyiv().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def staff_permissions(chat_id: int) -> set[str]:
+    conn = _connect()
+    row = conn.execute("SELECT permissions FROM staff_permissions WHERE chat_id = ?", (chat_id,)).fetchone()
+    conn.close()
+    return set(filter(None, row[0].split(","))) if row else set()
+
+
+def all_staff():
+    conn = _connect()
+    rows = conn.execute("SELECT chat_id, permissions FROM staff_permissions ORDER BY chat_id").fetchall()
+    conn.close()
+    return [{"chat_id": r[0], "permissions": set(filter(None, r[1].split(",")))} for r in rows]
+
+
+def remove_staff(chat_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM staff_permissions WHERE chat_id = ?", (chat_id,))
+    conn.commit()
+    conn.close()
+
+
+def add_material(group_name: str, subject: str, title: str, url: str, created_by: int):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO materials (group_name, subject, title, url, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (group_name, subject, title, url, created_by, _today_kyiv().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def materials_for_group(group_name: str, query: str | None = None):
+    conn = _connect()
+    if query:
+        rows = conn.execute(
+            "SELECT id, subject, title, url FROM materials WHERE group_name = ? AND subject LIKE ? ORDER BY id DESC",
+            (group_name, f"%{query}%"),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT id, subject, title, url FROM materials WHERE group_name = ? ORDER BY subject, id DESC", (group_name,)
+        ).fetchall()
+    conn.close()
+    return [{"id": r[0], "subject": r[1], "title": r[2], "url": r[3]} for r in rows]
+
+
+def delete_material(material_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM materials WHERE id = ?", (material_id,))
+    conn.commit()
+    conn.close()
 
 
 # ------------------------------------------------------------- overrides
