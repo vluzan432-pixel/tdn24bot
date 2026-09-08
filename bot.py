@@ -51,6 +51,7 @@ import db
 from schedule_data import (
     DAY_NAMES,
     GROUPS,
+    TIME_START_RE,
     find_zoom,
     lesson_key,
     lesson_start_time,
@@ -800,6 +801,15 @@ async def group_edit_value_received(message: Message, state: FSMContext):
     text = message.text.strip()
     if mode == "change" and text == "-":
         pass  # лишаємо без змін
+    elif field_key == "time" and not TIME_START_RE.search(text):
+        # Без розпізнаваного часу (напр. "14:10") lesson_start_time() пізніше
+        # мовчки поверне None, і check_reminders() тихо пропустить цю пару —
+        # ловимо це одразу тут, а не після того, як нагадування вже не прийшло.
+        await message.answer(
+            f"Не бачу часу у форматі ГГ:ХХ у «{html.escape(text)}». "
+            f"Введи {fields[field_idx][1]} ще раз (напр. «14:10 - 15:30»):"
+        )
+        return
     else:
         values[field_key] = text
 
@@ -1204,27 +1214,40 @@ async def check_reminders():
     today = now.date()
 
     for user in db.all_users():
-        group = user["group"]
-        lead = user["reminder_minutes"]
-        for entry in build_day_entries(user["chat_id"], group, today):
-            if entry.get("cancelled"):
-                continue
-            start = lesson_start_time(entry)
-            if not start:
-                continue
-            start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
-            minutes_until = (start_dt - now).total_seconds() / 60
-            if not (0 < minutes_until <= lead):
-                continue
-            key = entry["note_key"]
-            if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
-                continue
-            text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
-            try:
-                await bot.send_message(user["chat_id"], text)
-            except Exception:
-                log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
-            db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
+        # КРИТИЧНО: кожен користувач обробляється в своєму try/except.
+        # Раніше виняток у build_day_entries() (погані дані в overrides,
+        # збій зв'язку з Turso тощо) для ОДНОГО користувача обривав увесь
+        # цикл — і жоден наступний користувач у списку взагалі не
+        # перевірявся на цьому запуску /cron. Тепер поганий запис одного
+        # користувача/групи не заважає надіслати нагадування решті.
+        try:
+            group = user["group"]
+            lead = user["reminder_minutes"]
+            for entry in build_day_entries(user["chat_id"], group, today):
+                if entry.get("cancelled"):
+                    continue
+                start = lesson_start_time(entry)
+                if not start:
+                    continue
+                start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
+                minutes_until = (start_dt - now).total_seconds() / 60
+                if not (0 < minutes_until <= lead):
+                    continue
+                key = entry["note_key"]
+                if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
+                    continue
+                text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
+                try:
+                    await bot.send_message(user["chat_id"], text)
+                except Exception:
+                    log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
+                db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
+        except Exception:
+            log.exception(
+                "Збій обробки нагадувань для chat_id=%s (група=%s) — інші користувачі не постраждали",
+                user.get("chat_id"),
+                user.get("group"),
+            )
 
 
 # --------------------------------------------------------------------- HTTP
