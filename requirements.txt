@@ -3,3 +3,4 @@ aiohttp>=3.9
 python-docx>=1.1
 libsql>=0.1.4
 tzdata
+openpyxl>=3.1,<4
