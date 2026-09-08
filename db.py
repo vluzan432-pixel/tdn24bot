@@ -141,6 +141,28 @@ def all_notes(chat_id: int):
     return [{"id": r[0], "lesson_label": r[1], "text": r[2], "created_at": r[3]} for r in rows]
 
 
+def get_note(chat_id: int, note_id: int):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id, text, created_at FROM notes WHERE chat_id = ? AND id = ?",
+        (chat_id, note_id),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"id": row[0], "text": row[1], "created_at": row[2]}
+
+
+def update_note(chat_id: int, note_id: int, text: str):
+    conn = _connect()
+    conn.execute(
+        "UPDATE notes SET text = ? WHERE chat_id = ? AND id = ?",
+        (text, chat_id, note_id),
+    )
+    conn.commit()
+    conn.close()
+
+
 def delete_note(chat_id: int, note_id: int):
     conn = _connect()
     conn.execute("DELETE FROM notes WHERE chat_id = ? AND id = ?", (chat_id, note_id))
