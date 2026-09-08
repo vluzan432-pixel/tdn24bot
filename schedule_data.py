@@ -17,8 +17,23 @@ TYPE_LABELS = {
     "сем": ("Семінар", "💬"),
     "лаб": ("Лабораторна робота", "🧪"),
     "контр": ("Контрольний захід", "🧾"),
-    "мк": ("Модульний контроль", "🧾"),
+    "мк": ("Модульний контроль", "📦"),
+    "пк": ("Проміжний контроль", "🎯"),
 }
+
+# Пошук за префіксом, а не точним співпадінням — щоб "Семінар." чи
+# "Практ." розпізнавались так само, як звичні короткі "Сем."/"Пр.".
+# Порядок важливий лише якби один префікс був початком іншого — тут такого
+# немає, але "пк" перевіряємо окремо від "пр", бо обидва починаються на "п".
+_TYPE_PREFIXES = [
+    ("лек", "лек"),
+    ("сем", "сем"),
+    ("лаб", "лаб"),
+    ("пк", "пк"),
+    ("контр", "контр"),
+    ("мк", "мк"),
+    ("пр", "пр"),
+]
 
 SCHEDULE_PATH = os.environ.get("SCHEDULE_PATH", "schedules.json")
 ZOOM_PATH = os.environ.get("ZOOM_PATH", "zoom_links.json")
@@ -37,9 +52,49 @@ GROUPS = sorted(SCHEDULES.keys())
 TIME_START_RE = re.compile(r"(\d{1,2})[:.](\d{2})")
 
 
+def classify_type(abbrev: str) -> str:
+    key = (abbrev or "").strip().lower().rstrip(".")
+    for prefix, canon in _TYPE_PREFIXES:
+        if key.startswith(prefix):
+            return canon
+    return key
+
+
 def type_label(abbrev: str):
-    key = abbrev.strip().lower().rstrip(".")
+    key = classify_type(abbrev)
     return TYPE_LABELS.get(key, (abbrev.strip(), "🔖"))
+
+
+def _normalize_subject(subject: str) -> str:
+    return re.sub(r"\s+", " ", (subject or "").strip().lower())
+
+
+_lecture_subjects_cache: dict[str, set] = {}
+
+
+def _lecture_subjects(group: str) -> set:
+    """Множина предметів групи, у яких десь у розкладі є хоча б одна лекція.
+    Рахується один раз на групу і кешується (SCHEDULES не змінюється без
+    рестарту сервісу, тож кеш безпечний)."""
+    if group not in _lecture_subjects_cache:
+        subjects = set()
+        schedule = SCHEDULES.get(group) or {}
+        for day_lessons in schedule.get("days", {}).values():
+            for lesson in day_lessons:
+                for s in lesson.get("sessions", []):
+                    if classify_type(s.get("type")) == "лек":
+                        subjects.add(_normalize_subject(lesson.get("subject")))
+                        break
+        _lecture_subjects_cache[group] = subjects
+    return _lecture_subjects_cache[group]
+
+
+def subject_has_lectures(group: str, subject: str) -> bool:
+    """True, якщо в предмета десь у розкладі групи є лекції — тобто це
+    "лекційний" предмет, і випадкова практична серед лекцій — рідкісна,
+    вартісна для показу подія. Якщо предмет виключно практичний (лекцій
+    немає взагалі), його регулярні практичні — це рутина, не "важливе"."""
+    return _normalize_subject(subject) in _lecture_subjects(group)
 
 
 def find_zoom(teacher):
