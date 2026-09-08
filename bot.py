@@ -310,18 +310,20 @@ def format_entry(entry: dict) -> str:
     return "\n".join(lines)
 
 
-def format_day_for_chat(chat_id: int, group: str, d: date) -> str:
+def format_day_for_chat(chat_id: int, group: str, d: date, entries: list | None = None) -> str:
     day_name = DAY_NAMES[d.weekday()]
     header = f"📅 <b>{day_name}, {d.strftime('%d.%m.%Y')}</b>\n👥 Група: {html.escape(group)}"
 
-    entries = build_day_entries(chat_id, group, d)
+    if entries is None:
+        entries = build_day_entries(chat_id, group, d)
     if not entries:
         return header + "\n\nПар немає 🎉"
 
+    notes_by_lesson = db.notes_for_lessons(chat_id, [entry["note_key"] for entry in entries])
     blocks = []
     for entry in entries:
         text = format_entry(entry)
-        notes = db.get_notes(chat_id, entry["note_key"])
+        notes = notes_by_lesson[entry["note_key"]]
         if notes:
             note_lines = "\n".join(f"  📝 {html.escape(n['text'])}" for n in notes)
             text += f"\n{note_lines}"
@@ -362,7 +364,7 @@ def upcoming_important_text(group: str) -> str:
     return "🗓 <b>Найближчі семінари / практичні / контролі (7 днів):</b>\n\n" + "\n".join(lines)
 
 
-def keyboard_for_day(chat_id: int, group: str, d: date) -> InlineKeyboardMarkup:
+def keyboard_for_day(chat_id: int, group: str, d: date, entries: list | None = None) -> InlineKeyboardMarkup:
     prev_day = (d - timedelta(days=1)).isoformat()
     next_day = (d + timedelta(days=1)).isoformat()
     rows = [
@@ -373,7 +375,8 @@ def keyboard_for_day(chat_id: int, group: str, d: date) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📅 На сьогодні", callback_data="today")],
     ]
 
-    entries = build_day_entries(chat_id, group, d)
+    if entries is None:
+        entries = build_day_entries(chat_id, group, d)
     if any(find_zoom(e.get("teacher")) for e in entries if not e.get("cancelled")):
         rows.append([InlineKeyboardButton(text="🎥 Посилання в Zoom", callback_data=f"zoom_menu:{d.isoformat()}")])
 
@@ -409,10 +412,13 @@ def zoom_info_keyboard(d: date) -> InlineKeyboardMarkup:
     )
 
 
-def notes_menu_keyboard(chat_id: int, group: str, d: date) -> InlineKeyboardMarkup:
+def notes_menu_keyboard(chat_id: int, group: str, d: date, entries: list | None = None) -> InlineKeyboardMarkup:
     rows = []
-    for idx, entry in enumerate(build_day_entries(chat_id, group, d)):
-        count = len(db.get_notes(chat_id, entry["note_key"]))
+    if entries is None:
+        entries = build_day_entries(chat_id, group, d)
+    notes_by_lesson = db.notes_for_lessons(chat_id, [entry["note_key"] for entry in entries])
+    for idx, entry in enumerate(entries):
+        count = len(notes_by_lesson[entry["note_key"]])
         subject = entry.get("subject") or f"Пара {entry.get('pair')}"
         label = subject if len(subject) <= 30 else subject[:27] + "..."
         mark = f"📝×{count}" if count else "➕"
@@ -998,9 +1004,10 @@ async def cb_today(callback: CallbackQuery):
         await callback.answer()
         return
     today = today_kyiv()
+    entries = build_day_entries(callback.from_user.id, group, today)
     await callback.message.edit_text(
-        format_day_for_chat(callback.from_user.id, group, today),
-        reply_markup=keyboard_for_day(callback.from_user.id, group, today),
+        format_day_for_chat(callback.from_user.id, group, today, entries),
+        reply_markup=keyboard_for_day(callback.from_user.id, group, today, entries),
     )
     await callback.answer()
 
@@ -1012,9 +1019,10 @@ async def cb_day(callback: CallbackQuery):
         await callback.answer()
         return
     d = date.fromisoformat(callback.data.split(":", 1)[1])
+    entries = build_day_entries(callback.from_user.id, group, d)
     await callback.message.edit_text(
-        format_day_for_chat(callback.from_user.id, group, d),
-        reply_markup=keyboard_for_day(callback.from_user.id, group, d),
+        format_day_for_chat(callback.from_user.id, group, d, entries),
+        reply_markup=keyboard_for_day(callback.from_user.id, group, d, entries),
     )
     await callback.answer()
 
@@ -1117,7 +1125,11 @@ async def cb_notes_menu(callback: CallbackQuery):
         await callback.answer()
         return
     d = date.fromisoformat(callback.data.split(":", 1)[1])
-    await callback.message.edit_text("📝 Обери предмет:", reply_markup=notes_menu_keyboard(callback.from_user.id, group, d))
+    entries = build_day_entries(callback.from_user.id, group, d)
+    await callback.message.edit_text(
+        "📝 Обери предмет:",
+        reply_markup=notes_menu_keyboard(callback.from_user.id, group, d, entries),
+    )
     await callback.answer()
 
 
