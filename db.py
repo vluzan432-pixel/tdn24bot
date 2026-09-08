@@ -48,6 +48,36 @@ CREATE TABLE IF NOT EXISTS sent_reminders (
     sent_date TEXT NOT NULL,
     PRIMARY KEY (chat_id, lesson_key, sent_date)
 );
+
+CREATE TABLE IF NOT EXISTS overrides (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    base_pair TEXT,
+    base_time TEXT,
+    pair TEXT,
+    time TEXT,
+    subject TEXT,
+    teacher TEXT,
+    room TEXT,
+    note TEXT,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS individual_lessons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    weekday TEXT,
+    date TEXT,
+    time TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    teacher TEXT,
+    room TEXT,
+    note TEXT,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -194,5 +224,132 @@ def mark_reminder_sent(chat_id: int, lesson_key: str, day_iso: str):
         "INSERT OR IGNORE INTO sent_reminders (chat_id, lesson_key, sent_date) VALUES (?, ?, ?)",
         (chat_id, lesson_key, day_iso),
     )
+    conn.commit()
+    conn.close()
+
+
+def users_in_group(group_name: str):
+    """Усі користувачі групи, незалежно від того, увімкнені в них нагадування
+    чи ні — використовується для розсилки повідомлень про зміни в розкладі."""
+    conn = _connect()
+    rows = conn.execute("SELECT chat_id FROM users WHERE group_name = ?", (group_name,)).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+# ------------------------------------------------------------- overrides
+
+
+def add_override(
+    group_name: str,
+    date_str: str,
+    kind: str,
+    created_by: int,
+    base_pair: str | None = None,
+    base_time: str | None = None,
+    pair: str | None = None,
+    time: str | None = None,
+    subject: str | None = None,
+    teacher: str | None = None,
+    room: str | None = None,
+    note: str | None = None,
+):
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO overrides "
+        "(group_name, date, kind, base_pair, base_time, pair, time, subject, teacher, room, note, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            group_name,
+            date_str,
+            kind,
+            base_pair,
+            base_time,
+            pair,
+            time,
+            subject,
+            teacher,
+            room,
+            note,
+            created_by,
+            _today_kyiv().isoformat(),
+        ),
+    )
+    conn.commit()
+    override_id = cur.lastrowid
+    conn.close()
+    return override_id
+
+
+def overrides_for(group_name: str, date_str: str):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, kind, base_pair, base_time, pair, time, subject, teacher, room, note "
+        "FROM overrides WHERE group_name = ? AND date = ?",
+        (group_name, date_str),
+    ).fetchall()
+    conn.close()
+    cols = ["id", "kind", "base_pair", "base_time", "pair", "time", "subject", "teacher", "room", "note"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def delete_override(override_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM overrides WHERE id = ?", (override_id,))
+    conn.commit()
+    conn.close()
+
+
+# ------------------------------------------------------- індивідуальні заняття
+
+
+def add_individual_lesson(
+    chat_id: int,
+    subject: str,
+    time: str,
+    weekday: str | None = None,
+    date: str | None = None,
+    teacher: str | None = None,
+    room: str | None = None,
+    note: str | None = None,
+):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO individual_lessons "
+        "(chat_id, weekday, date, time, subject, teacher, room, note, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (chat_id, weekday, date, time, subject, teacher, room, note, _today_kyiv().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def individual_lessons_for(chat_id: int, weekday: str, date_str: str):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, weekday, date, time, subject, teacher, room, note "
+        "FROM individual_lessons WHERE chat_id = ? AND (weekday = ? OR date = ?)",
+        (chat_id, weekday, date_str),
+    ).fetchall()
+    conn.close()
+    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def all_individual_lessons(chat_id: int):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, weekday, date, time, subject, teacher, room, note "
+        "FROM individual_lessons WHERE chat_id = ? ORDER BY id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    cols = ["id", "weekday", "date", "time", "subject", "teacher", "room", "note"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def delete_individual_lesson(chat_id: int, lesson_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM individual_lessons WHERE chat_id = ? AND id = ?", (chat_id, lesson_id))
     conn.commit()
     conn.close()
