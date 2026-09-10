@@ -1496,6 +1496,7 @@ async def cmd_admin(message: Message):
     if "materials" in rights:
         lines.append("• «📚 Матеріали» → «➕ Додати матеріал» — прикріпити файл (ноти, PDF, таблицю) або посилання")
         lines.append("• <code>/material Предмет | Назва | https://посилання</code> — швидко додати лише лінк")
+        lines.append("• <code>/materials del назва</code> — видалити матеріал за назвою (запитає уточнення, якщо збігів кілька)")
     if "polls" in rights:
         lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
     if is_owner(message.from_user.id):
@@ -1615,11 +1616,66 @@ async def cmd_material(message: Message):
     await message.answer("Матеріал додано ✅")
 
 
+def material_search_results_keyboard(materials: list, chat_id: int, delete_mode: bool = False) -> InlineKeyboardMarkup:
+    """delete_mode=True — кожна кнопка сама по собі видаляє матеріал (для
+    уточнення, який саме видалити, коли пошук дав кілька збігів)."""
+    rows = []
+    for m in materials:
+        label = f"{m['subject']} — {m['title']}"
+        label = label if len(label) <= 40 else label[:37] + "..."
+        icon = "🗑" if delete_mode else "📎"
+        callback = f"mats_del:{m['id']}" if delete_mode else f"mats_get:{m['id']}"
+        rows.append([InlineKeyboardButton(text=f"{icon} {label}", callback_data=callback)])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(Command("materials"))
 async def cmd_materials(message: Message):
     group = await require_group(message)
-    if group:
-        await message.answer(materials_text(group, message.text.partition(" ")[2].strip() or None), disable_web_page_preview=True)
+    if not group:
+        return
+    raw = message.text.partition(" ")[2].strip()
+
+    if raw.lower().startswith("del "):
+        if not has_permission(message.from_user.id, "materials"):
+            await message.answer("Видаляти матеріали може лише відповідальний із правом <code>materials</code> 🔒")
+            return
+        query = raw[4:].strip()
+        if not query:
+            await message.answer("Приклад: <code>/materials del Лист дружини</code>")
+            return
+        matches = db.search_materials(group, query)
+        if not matches:
+            await message.answer(f"За запитом «{html.escape(query)}» нічого не знайдено.")
+        elif len(matches) == 1:
+            m = matches[0]
+            db.delete_material(m["id"])
+            await message.answer(f"Видалено: <b>{html.escape(m['subject'])}</b> — {html.escape(m['title'])} ✅")
+        else:
+            await message.answer(
+                f"Знайдено кілька збігів за «{html.escape(query)}» — обери, що саме видалити:",
+                reply_markup=material_search_results_keyboard(matches, message.from_user.id, delete_mode=True),
+            )
+        return
+
+    if raw.lower().startswith("find "):
+        raw = raw[5:].strip()
+
+    if raw:
+        results = db.search_materials(group, raw)
+        if not results:
+            await message.answer(f"🔎 За запитом «{html.escape(raw)}» нічого не знайдено (шукає і по предмету, і по назві).")
+            return
+        await message.answer(
+            f"🔎 Знайдено за запитом «{html.escape(raw)}»:",
+            reply_markup=material_search_results_keyboard(results, message.from_user.id),
+        )
+        return
+
+    subjects = db.material_subjects(group)
+    text = "📚 <b>Матеріали групи</b>\nОбери предмет:" if subjects else "📚 Матеріалів поки немає."
+    await message.answer(text, reply_markup=materials_subject_keyboard(group, message.from_user.id))
 
 
 @dp.message(Command("update"))
@@ -1919,25 +1975,6 @@ async def cb_toggle_announcements(callback: CallbackQuery):
     await callback.answer("Оголошення увімкнено ✅" if enabled else "Звичайні оголошення вимкнено")
 
 
-def materials_text(group: str, query: str | None = None) -> str:
-    """Текстовий список для команди /materials <запит> (пошук) — файлові
-    матеріали тут без прямого посилання, бо файл можна надіслати тільки
-    окремим повідомленням; для отримання самого файлу є кнопкове меню
-    «📚 Матеріали»."""
-    materials = db.materials_for_group(group, query)
-    if not materials:
-        return "📚 Матеріалів поки немає." if not query else "📚 За таким предметом матеріалів не знайдено."
-    lines = ["📚 <b>Матеріали групи:</b>\n"]
-    for item in materials:
-        subject = html.escape(item["subject"])
-        title = html.escape(item["title"])
-        if item.get("url"):
-            lines.append(f"• <b>{subject}</b> — <a href=\"{html.escape(item['url'])}\">{title}</a>")
-        else:
-            lines.append(f"• <b>{subject}</b> — 📎 {title} (файл — відкрий через кнопку «📚 Матеріали» в меню)")
-    return "\n".join(lines)
-
-
 def materials_subject_keyboard(group: str, chat_id: int) -> InlineKeyboardMarkup:
     rows = []
     for idx, (subject, count) in enumerate(db.material_subjects(group)):
@@ -1951,16 +1988,12 @@ def materials_subject_keyboard(group: str, chat_id: int) -> InlineKeyboardMarkup
 
 
 def material_item_keyboard(group: str, subject: str, chat_id: int) -> InlineKeyboardMarkup:
-    can_delete = has_permission(chat_id, "materials")
     rows = []
     for m in db.materials_for_group(group):
         if m["subject"] != subject:
             continue
         label = m["title"] if len(m["title"]) <= 30 else m["title"][:27] + "..."
-        row = [InlineKeyboardButton(text=f"📎 {label}", callback_data=f"mats_get:{m['id']}")]
-        if can_delete:
-            row.append(InlineKeyboardButton(text="🗑", callback_data=f"mats_del:{m['id']}"))
-        rows.append(row)
+        rows.append([InlineKeyboardButton(text=f"📎 {label}", callback_data=f"mats_get:{m['id']}")])
     rows.append([InlineKeyboardButton(text="🔙 До предметів", callback_data="materials_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
