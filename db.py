@@ -99,6 +99,9 @@ CREATE TABLE IF NOT EXISTS materials (
     subject TEXT NOT NULL,
     title TEXT NOT NULL,
     url TEXT NOT NULL,
+    file_id TEXT,
+    file_name TEXT,
+    file_type TEXT,
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
@@ -166,6 +169,11 @@ def init_db():
         conn.execute("ALTER TABLE individual_lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
     except Exception:
         pass  # Стовпець уже існує.
+    for column in ("file_id TEXT", "file_name TEXT", "file_type TEXT"):
+        try:
+            conn.execute(f"ALTER TABLE materials ADD COLUMN {column}")
+        except Exception:
+            pass  # Стовпець уже існує.
     # Одноразове перенесення старого одиничного reminder_minutes у нову
     # таблицю з кількома нагадуваннями — тільки для тих, у кого там ще
     # порожньо (нових користувачів це не чіпає, вони отримають лише те,
@@ -455,11 +463,21 @@ def remove_staff(chat_id: int):
     conn.close()
 
 
-def add_material(group_name: str, subject: str, title: str, url: str, created_by: int):
+def add_material(
+    group_name: str,
+    subject: str,
+    title: str,
+    url: str,
+    created_by: int,
+    file_id: str | None = None,
+    file_name: str | None = None,
+    file_type: str | None = None,
+):
     conn = _connect()
     conn.execute(
-        "INSERT INTO materials (group_name, subject, title, url, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-        (group_name, subject, title, url, created_by, _today_kyiv().isoformat()),
+        "INSERT INTO materials (group_name, subject, title, url, file_id, file_name, file_type, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (group_name, subject, title, url or "", file_id, file_name, file_type, created_by, _today_kyiv().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -467,17 +485,45 @@ def add_material(group_name: str, subject: str, title: str, url: str, created_by
 
 def materials_for_group(group_name: str, query: str | None = None):
     conn = _connect()
+    cols_sql = "id, subject, title, url, file_id, file_name, file_type"
     if query:
         rows = conn.execute(
-            "SELECT id, subject, title, url FROM materials WHERE group_name = ? AND subject LIKE ? ORDER BY id DESC",
+            f"SELECT {cols_sql} FROM materials WHERE group_name = ? AND subject LIKE ? ORDER BY id DESC",
             (group_name, f"%{query}%"),
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT id, subject, title, url FROM materials WHERE group_name = ? ORDER BY subject, id DESC", (group_name,)
+            f"SELECT {cols_sql} FROM materials WHERE group_name = ? ORDER BY subject, id DESC", (group_name,)
         ).fetchall()
     conn.close()
-    return [{"id": r[0], "subject": r[1], "title": r[2], "url": r[3]} for r in rows]
+    cols = ["id", "subject", "title", "url", "file_id", "file_name", "file_type"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
+def material_subjects(group_name: str):
+    """Список (предмет, кількість матеріалів) для групи — для меню вибору
+    предмета при перегляді матеріалів."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT subject, COUNT(*) FROM materials WHERE group_name = ? GROUP BY subject ORDER BY subject",
+        (group_name,),
+    ).fetchall()
+    conn.close()
+    return [(r[0], r[1]) for r in rows]
+
+
+def get_material(material_id: int):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id, group_name, subject, title, url, file_id, file_name, file_type "
+        "FROM materials WHERE id = ?",
+        (material_id,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    cols = ["id", "group_name", "subject", "title", "url", "file_id", "file_name", "file_type"]
+    return dict(zip(cols, row))
 
 
 def delete_material(material_id: int):
