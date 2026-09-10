@@ -97,6 +97,25 @@ def subject_has_lectures(group: str, subject: str) -> bool:
     return _normalize_subject(subject) in _lecture_subjects(group)
 
 
+_group_subjects_cache: dict[str, list] = {}
+
+
+def group_subjects(group: str) -> list:
+    """Відсортований список унікальних назв предметів групи (за офіційним
+    розкладом) — використовується для вибору предмета при додаванні
+    матеріалу, щоб не передруковувати назву вручну щоразу."""
+    if group not in _group_subjects_cache:
+        subjects = set()
+        schedule = SCHEDULES.get(group) or {}
+        for day_lessons in schedule.get("days", {}).values():
+            for lesson in day_lessons:
+                subject = (lesson.get("subject") or "").strip()
+                if subject:
+                    subjects.add(subject)
+        _group_subjects_cache[group] = sorted(subjects)
+    return _group_subjects_cache[group]
+
+
 def find_zoom(teacher):
     if not teacher:
         return None
