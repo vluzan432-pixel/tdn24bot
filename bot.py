@@ -1609,6 +1609,34 @@ async def cmd_materials(message: Message):
         await message.answer(materials_text(group, message.text.partition(" ")[2].strip() or None), disable_web_page_preview=True)
 
 
+@dp.message(Command("update"))
+async def cmd_update(message: Message):
+    if not _owner_only(message):
+        await message.answer("Записувати оновлення бота може лише головний адміністратор 🔒")
+        return
+    text = message.text.partition(" ")[2].strip()
+    if not text:
+        await message.answer("Формат: <code>/update що змінилось у боті</code>")
+        return
+    db.add_changelog_entry(text, message.from_user.id)
+    chat_ids = db.all_registered_chat_ids()
+    await _broadcast_to(chat_ids, f"🛠 <b>Оновлення бота:</b>\n{html.escape(text)}")
+    await message.answer(f"Записано й розіслано {len(chat_ids)} користувачам ✅")
+
+
+@dp.message(Command("updates"))
+async def cmd_updates(message: Message):
+    entries = db.recent_changelog(10)
+    if not entries:
+        await message.answer("Оновлень поки не записано.")
+        return
+    lines = ["🛠 <b>Історія оновлень бота:</b>\n"]
+    for e in entries:
+        d = date.fromisoformat(e["created_at"])
+        lines.append(f"<b>{d.strftime('%d.%m.%Y')}</b>: {html.escape(e['text'])}")
+    await message.answer("\n\n".join(lines))
+
+
 @dp.message(Command("poll"))
 async def cmd_poll(message: Message):
     if not has_permission(message.from_user.id, "polls"):
