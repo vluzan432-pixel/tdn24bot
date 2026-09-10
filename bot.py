@@ -2088,8 +2088,10 @@ async def check_reminders():
         try:
             group = user["group"]
             # Кілька офсетів на користувача (напр. [15, 10, 5]) — кожен
-            # перевіряється й позначається "надіслано" окремо, тож людина
-            # отримає нагадування на кожному обраному рубежі, а не лише раз.
+            # відстежується окремим ключем sent_reminders, тож людина
+            # отримує нагадування на кожному обраному рубежі. Якщо кілька
+            # рубежів дозрівають в один прохід — див. due_offsets нижче,
+            # це схлопується в одне повідомлення, а не спам з трьох.
             offsets = db.get_reminder_offsets(user["chat_id"]) or [15]
             for entry in build_day_entries(user["chat_id"], group, today):
                 if entry.get("cancelled"):
@@ -2100,35 +2102,49 @@ async def check_reminders():
                 start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
                 minutes_until = (start_dt - now).total_seconds() / 60
 
+                # Спершу збираємо ВСІ офсети, що зараз "дозріли" й ще не
+                # надсилались. Якщо тестова пара створена за кілька хвилин
+                # до початку (чи пінг сильно спізнився), кілька рубежів
+                # (15/10/5) можуть опинитись у вікні одночасно — раніше це
+                # означало 3 окремих повідомлення підряд. Тепер шлемо ОДНЕ
+                # повідомлення з реальним часом до пари й одразу позначаємо
+                # всі "дозрілі" рубежі опрацьованими, щоб вони не спливли
+                # повторно на наступному проході.
+                due_offsets = []
                 for offset in offsets:
                     if not (-GRACE_MINUTES <= minutes_until <= offset):
                         continue
-                    # Окремий ключ на кожен офсет — інакше надсилання за
-                    # 15 хв позначило б "вже нагадали" й для рубежів 10/5 хв.
                     key = f"{entry['note_key']}@{offset}"
                     if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
                         continue
-                    if minutes_until > 0:
-                        text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
-                    else:
-                        text = (
-                            f"⏰ Пара вже почалась {abs(int(minutes_until))} хв тому "
-                            f"(затримка пінгу):\n\n{format_entry(entry)}"
-                        )
-                    zoom_keyboard = None
-                    found = find_zoom(entry.get("teacher"))
-                    if found:
-                        _surname, info = found
-                        zoom_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                            InlineKeyboardButton(text="🎥 Приєднатись до Zoom", url=info["link"])
-                        ]])
-                    try:
-                        await bot.send_message(user["chat_id"], text, reply_markup=zoom_keyboard)
-                        reminders_sent += 1
-                    except Exception:
-                        log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
-                        errors += 1
-                    db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
+                    due_offsets.append(offset)
+
+                if not due_offsets:
+                    continue
+
+                minutes_display = round(minutes_until)
+                if minutes_until > 0:
+                    text = f"⏰ Через {minutes_display} хв:\n\n{format_entry(entry)}"
+                else:
+                    text = (
+                        f"⏰ Пара вже почалась {abs(minutes_display)} хв тому "
+                        f"(затримка пінгу):\n\n{format_entry(entry)}"
+                    )
+                zoom_keyboard = None
+                found = find_zoom(entry.get("teacher"))
+                if found:
+                    _surname, info = found
+                    zoom_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                        InlineKeyboardButton(text="🎥 Приєднатись до Zoom", url=info["link"])
+                    ]])
+                try:
+                    await bot.send_message(user["chat_id"], text, reply_markup=zoom_keyboard)
+                    reminders_sent += 1
+                except Exception:
+                    log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
+                    errors += 1
+                for offset in due_offsets:
+                    db.mark_reminder_sent(user["chat_id"], f"{entry['note_key']}@{offset}", today.isoformat())
         except Exception:
             log.exception(
                 "Збій обробки нагадувань для chat_id=%s (група=%s) — інші користувачі не постраждали",
