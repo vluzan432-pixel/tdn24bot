@@ -102,6 +102,12 @@ CREATE TABLE IF NOT EXISTS materials (
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS reminder_offsets (
+    chat_id INTEGER NOT NULL,
+    minutes INTEGER NOT NULL,
+    PRIMARY KEY (chat_id, minutes)
+);
 """
 
 
@@ -153,6 +159,15 @@ def init_db():
         conn.execute("ALTER TABLE individual_lessons ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'")
     except Exception:
         pass  # Стовпець уже існує.
+    # Одноразове перенесення старого одиничного reminder_minutes у нову
+    # таблицю з кількома нагадуваннями — тільки для тих, у кого там ще
+    # порожньо (нових користувачів це не чіпає, вони отримають лише те,
+    # що самі виберуть).
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_offsets (chat_id, minutes) "
+        "SELECT chat_id, reminder_minutes FROM users "
+        "WHERE chat_id NOT IN (SELECT chat_id FROM reminder_offsets)"
+    )
     conn.commit()
     conn.close()
 
@@ -163,6 +178,14 @@ def set_group(chat_id: int, group_name: str):
         "INSERT INTO users (chat_id, group_name) VALUES (?, ?) "
         "ON CONFLICT(chat_id) DO UPDATE SET group_name = excluded.group_name",
         (chat_id, group_name),
+    )
+    # Дефолтне нагадування за 15 хв для новачків — не чіпає тих, у кого вже є
+    # власні налаштовані офсети (INSERT OR IGNORE нічого не зробить, якщо в
+    # користувача вже є хоч один рядок).
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_offsets (chat_id, minutes) "
+        "SELECT ?, 15 WHERE NOT EXISTS (SELECT 1 FROM reminder_offsets WHERE chat_id = ?)",
+        (chat_id, chat_id),
     )
     conn.commit()
     conn.close()
@@ -187,15 +210,38 @@ def get_user(chat_id: int):
 def all_users():
     conn = _connect()
     rows = conn.execute(
-        "SELECT chat_id, group_name, reminder_minutes, reminders_on FROM users WHERE reminders_on = 1"
+        "SELECT chat_id, group_name, reminders_on FROM users WHERE reminders_on = 1"
     ).fetchall()
     conn.close()
-    return [{"chat_id": r[0], "group": r[1], "reminder_minutes": r[2], "reminders_on": bool(r[3])} for r in rows]
+    return [{"chat_id": r[0], "group": r[1], "reminders_on": bool(r[2])} for r in rows]
 
 
-def set_reminder_minutes(chat_id: int, minutes: int):
+def get_reminder_offsets(chat_id: int) -> list:
+    """Список хвилин 'за скільки нагадати' для користувача, за спаданням
+    (напр. [15, 10, 5]). Порожній список — нагадувань не налаштовано взагалі
+    (у щойно зареєстрованих буде [15] завдяки міграції/дефолту нижче)."""
     conn = _connect()
-    conn.execute("UPDATE users SET reminder_minutes = ? WHERE chat_id = ?", (minutes, chat_id))
+    rows = conn.execute(
+        "SELECT minutes FROM reminder_offsets WHERE chat_id = ? ORDER BY minutes DESC",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def add_reminder_offset(chat_id: int, minutes: int):
+    conn = _connect()
+    conn.execute(
+        "INSERT OR IGNORE INTO reminder_offsets (chat_id, minutes) VALUES (?, ?)",
+        (chat_id, minutes),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_reminder_offset(chat_id: int, minutes: int):
+    conn = _connect()
+    conn.execute("DELETE FROM reminder_offsets WHERE chat_id = ? AND minutes = ?", (chat_id, minutes))
     conn.commit()
     conn.close()
 
