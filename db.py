@@ -500,6 +500,20 @@ def materials_for_group(group_name: str, query: str | None = None):
     return [dict(zip(cols, r)) for r in rows]
 
 
+def search_materials(group_name: str, query: str):
+    """Пошук за НАЗВОЮ матеріалу АБО предметом (на відміну від
+    materials_for_group(query=...), який шукає лише по предмету)."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, subject, title, url, file_id, file_name, file_type FROM materials "
+        "WHERE group_name = ? AND (subject LIKE ? OR title LIKE ?) ORDER BY subject, id DESC",
+        (group_name, f"%{query}%", f"%{query}%"),
+    ).fetchall()
+    conn.close()
+    cols = ["id", "subject", "title", "url", "file_id", "file_name", "file_type"]
+    return [dict(zip(cols, r)) for r in rows]
+
+
 def material_subjects(group_name: str):
     """Список (предмет, кількість матеріалів) для групи — для меню вибору
     предмета при перегляді матеріалів."""
