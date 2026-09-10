@@ -57,6 +57,7 @@ from schedule_data import (
     TIME_START_RE,
     classify_type,
     find_zoom,
+    group_subjects,
     lesson_key,
     lesson_start_time,
     lessons_for_date,
@@ -121,6 +122,12 @@ class ImportScheduleState(StatesGroup):
     waiting_file = State()
     waiting_surname = State()
     waiting_confirmation = State()
+
+
+class MaterialState(StatesGroup):
+    waiting_subject = State()
+    waiting_title = State()
+    waiting_content = State()
 
 
 CHANGE_FIELDS = [
@@ -1487,7 +1494,8 @@ async def cmd_admin(message: Message):
         lines.append("• <code>/announce текст</code> — звичайне оголошення")
         lines.append("• <code>/urgent текст</code> — термінове оголошення")
     if "materials" in rights:
-        lines.append("• <code>/material Предмет | Назва | https://посилання</code>")
+        lines.append("• «📚 Матеріали» → «➕ Додати матеріал» — прикріпити файл (ноти, PDF, таблицю) або посилання")
+        lines.append("• <code>/material Предмет | Назва | https://посилання</code> — швидко додати лише лінк")
     if "polls" in rights:
         lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
     if is_owner(message.from_user.id):
@@ -1596,7 +1604,12 @@ async def cmd_material(message: Message):
         return
     parts = [p.strip() for p in message.text.partition(" ")[2].split("|")]
     if len(parts) != 3 or not all(parts) or not re.match(r"https?://", parts[2], re.I):
-        await message.answer("Формат: <code>/material Предмет | Назва | https://посилання</code>")
+        await message.answer(
+            "Формат: <code>/material Предмет | Назва | https://посилання</code>\n\n"
+            "Хочеш прикріпити файл (ноти, PDF, таблицю) замість посилання — "
+            "простіше через меню: «📚 Матеріали» → «➕ Додати матеріал», там бот "
+            "прийме сам файл, а не лише лінк."
+        )
         return
     db.add_material(group, parts[0], parts[1], parts[2], message.from_user.id)
     await message.answer("Матеріал додано ✅")
@@ -1907,16 +1920,59 @@ async def cb_toggle_announcements(callback: CallbackQuery):
 
 
 def materials_text(group: str, query: str | None = None) -> str:
+    """Текстовий список для команди /materials <запит> (пошук) — файлові
+    матеріали тут без прямого посилання, бо файл можна надіслати тільки
+    окремим повідомленням; для отримання самого файлу є кнопкове меню
+    «📚 Матеріали»."""
     materials = db.materials_for_group(group, query)
     if not materials:
         return "📚 Матеріалів поки немає." if not query else "📚 За таким предметом матеріалів не знайдено."
     lines = ["📚 <b>Матеріали групи:</b>\n"]
     for item in materials:
-        lines.append(
-            f"• <b>{html.escape(item['subject'])}</b> — "
-            f"<a href=\"{html.escape(item['url'])}\">{html.escape(item['title'])}</a>"
-        )
+        subject = html.escape(item["subject"])
+        title = html.escape(item["title"])
+        if item.get("url"):
+            lines.append(f"• <b>{subject}</b> — <a href=\"{html.escape(item['url'])}\">{title}</a>")
+        else:
+            lines.append(f"• <b>{subject}</b> — 📎 {title} (файл — відкрий через кнопку «📚 Матеріали» в меню)")
     return "\n".join(lines)
+
+
+def materials_subject_keyboard(group: str, chat_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, (subject, count) in enumerate(db.material_subjects(group)):
+        label = f"{subject} ({count})"
+        label = label if len(label) <= 35 else label[:32] + "..."
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"mats_subj:{idx}")])
+    if has_permission(chat_id, "materials"):
+        rows.append([InlineKeyboardButton(text="➕ Додати матеріал", callback_data="mats_add")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def material_item_keyboard(group: str, subject: str, chat_id: int) -> InlineKeyboardMarkup:
+    can_delete = has_permission(chat_id, "materials")
+    rows = []
+    for m in db.materials_for_group(group):
+        if m["subject"] != subject:
+            continue
+        label = m["title"] if len(m["title"]) <= 30 else m["title"][:27] + "..."
+        row = [InlineKeyboardButton(text=f"📎 {label}", callback_data=f"mats_get:{m['id']}")]
+        if can_delete:
+            row.append(InlineKeyboardButton(text="🗑", callback_data=f"mats_del:{m['id']}"))
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="🔙 До предметів", callback_data="materials_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def material_subject_choice_keyboard(group: str) -> InlineKeyboardMarkup:
+    rows = []
+    for idx, subject in enumerate(group_subjects(group)):
+        label = subject if len(subject) <= 35 else subject[:32] + "..."
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"mats_add_subj:{idx}")])
+    rows.append([InlineKeyboardButton(text="✏️ Інша назва", callback_data="mats_add_subj_custom")])
+    rows.append([InlineKeyboardButton(text="❌ Скасувати", callback_data="materials_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 @dp.callback_query(F.data == "materials_menu")
@@ -1925,8 +1981,180 @@ async def cb_materials_menu(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text(materials_text(group), reply_markup=back_to_menu_keyboard(), disable_web_page_preview=True)
+    subjects = db.material_subjects(group)
+    text = "📚 <b>Матеріали групи</b>\nОбери предмет:" if subjects else "📚 Матеріалів поки немає."
+    await callback.message.edit_text(text, reply_markup=materials_subject_keyboard(group, callback.from_user.id))
     await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mats_subj:"))
+async def cb_mats_subj(callback: CallbackQuery):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    idx = int(callback.data.split(":", 1)[1])
+    subjects = db.material_subjects(group)
+    if idx >= len(subjects):
+        await callback.answer("Не знайдено, онови список", show_alert=True)
+        return
+    subject = subjects[idx][0]
+    await callback.message.edit_text(
+        f"📚 <b>{html.escape(subject)}</b>", reply_markup=material_item_keyboard(group, subject, callback.from_user.id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mats_get:"))
+async def cb_mats_get(callback: CallbackQuery):
+    material_id = int(callback.data.split(":", 1)[1])
+    m = db.get_material(material_id)
+    if not m:
+        await callback.answer("Матеріал не знайдено", show_alert=True)
+        return
+    caption = f"📚 {html.escape(m['subject'])} — {html.escape(m['title'])}"
+    try:
+        if m.get("file_id"):
+            file_type = m.get("file_type") or "document"
+            sender = {
+                "photo": bot.send_photo,
+                "audio": bot.send_audio,
+                "video": bot.send_video,
+            }.get(file_type, bot.send_document)
+            await sender(callback.from_user.id, m["file_id"], caption=caption)
+        elif m.get("url"):
+            await bot.send_message(callback.from_user.id, f"{caption}\n🔗 {html.escape(m['url'])}")
+        else:
+            await callback.answer("У цього матеріалу немає ні файлу, ні посилання", show_alert=True)
+            return
+    except Exception:
+        log.exception("Не вдалось надіслати матеріал %s", material_id)
+        await callback.answer("Не вдалось надіслати, спробуй ще раз", show_alert=True)
+        return
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mats_del:"))
+async def cb_mats_del(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "materials"):
+        await callback.answer("Потрібне право materials 🔒", show_alert=True)
+        return
+    material_id = int(callback.data.split(":", 1)[1])
+    m = db.get_material(material_id)
+    if not m:
+        await callback.answer("Вже видалено", show_alert=True)
+        return
+    group, subject = m["group_name"], m["subject"]
+    db.delete_material(material_id)
+    remaining = [x for x in db.materials_for_group(group) if x["subject"] == subject]
+    if remaining:
+        await callback.message.edit_text(
+            f"📚 <b>{html.escape(subject)}</b>", reply_markup=material_item_keyboard(group, subject, callback.from_user.id)
+        )
+    else:
+        subjects = db.material_subjects(group)
+        text = "📚 <b>Матеріали групи</b>\nОбери предмет:" if subjects else "📚 Матеріалів поки немає."
+        await callback.message.edit_text(text, reply_markup=materials_subject_keyboard(group, callback.from_user.id))
+    await callback.answer("Видалено ✅")
+
+
+@dp.callback_query(F.data == "mats_add")
+async def cb_mats_add(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "materials"):
+        await callback.answer("Потрібне право materials 🔒", show_alert=True)
+        return
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await state.update_data(group=group)
+    await callback.message.edit_text("Для якого предмета матеріал?", reply_markup=material_subject_choice_keyboard(group))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("mats_add_subj:"))
+async def cb_mats_add_subj(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "materials"):
+        await callback.answer("Потрібне право materials 🔒", show_alert=True)
+        return
+    data = await state.get_data()
+    group = data.get("group") or await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    subjects = group_subjects(group)
+    idx = int(callback.data.split(":", 1)[1])
+    if idx >= len(subjects):
+        await callback.answer("Не знайдено, спробуй ще раз", show_alert=True)
+        return
+    subject = subjects[idx]
+    await state.update_data(group=group, subject=subject)
+    await state.set_state(MaterialState.waiting_title)
+    await callback.message.answer(f"Предмет: {html.escape(subject)}\nВведи коротку назву матеріалу (напр. «Ноти — Щедрик»):")
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "mats_add_subj_custom")
+async def cb_mats_add_subj_custom(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "materials"):
+        await callback.answer("Потрібне право materials 🔒", show_alert=True)
+        return
+    data = await state.get_data()
+    group = data.get("group") or await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await state.update_data(group=group)
+    await state.set_state(MaterialState.waiting_subject)
+    await callback.message.answer("Введи назву предмета:")
+    await callback.answer()
+
+
+@dp.message(StateFilter(MaterialState.waiting_subject))
+async def mats_subject_received(message: Message, state: FSMContext):
+    await state.update_data(subject=message.text.strip())
+    await state.set_state(MaterialState.waiting_title)
+    await message.answer("Введи коротку назву матеріалу (напр. «Ноти — Щедрик»):")
+
+
+@dp.message(StateFilter(MaterialState.waiting_title))
+async def mats_title_received(message: Message, state: FSMContext):
+    await state.update_data(title=message.text.strip())
+    await state.set_state(MaterialState.waiting_content)
+    await message.answer(
+        "Тепер надішли сам файл (документ, фото, аудіо, відео) АБО встав посилання одним повідомленням:"
+    )
+
+
+@dp.message(StateFilter(MaterialState.waiting_content))
+async def mats_content_received(message: Message, state: FSMContext):
+    data = await state.get_data()
+    group, subject, title = data["group"], data["subject"], data["title"]
+
+    file_id = file_name = file_type = None
+    url = ""
+
+    if message.document:
+        file_id, file_name, file_type = message.document.file_id, message.document.file_name, "document"
+    elif message.photo:
+        file_id, file_type = message.photo[-1].file_id, "photo"
+    elif message.audio:
+        file_id, file_name, file_type = message.audio.file_id, message.audio.file_name, "audio"
+    elif message.video:
+        file_id, file_name, file_type = message.video.file_id, message.video.file_name, "video"
+    elif message.voice:
+        file_id, file_type = message.voice.file_id, "audio"
+    elif message.text and re.match(r"https?://", message.text.strip(), re.I):
+        url = message.text.strip()
+    else:
+        await message.answer(
+            "Не розпізнав 🤔 Надішли документ/фото/аудіо/відео як вкладення, або встав звичайне https-посилання:"
+        )
+        return
+
+    await state.clear()
+    db.add_material(group, subject, title, url, message.from_user.id, file_id=file_id, file_name=file_name, file_type=file_type)
+    await message.answer("Матеріал додано ✅", reply_markup=back_to_menu_keyboard())
 
 
 async def _show_notes_lesson(target, chat_id: int, group: str, d: date, idx: int):
