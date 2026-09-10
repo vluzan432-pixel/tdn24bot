@@ -105,6 +105,10 @@ class NoteState(StatesGroup):
     waiting_text = State()
 
 
+class ReminderState(StatesGroup):
+    waiting_custom_minutes = State()
+
+
 class GroupEditState(StatesGroup):
     waiting_value = State()
 
@@ -871,30 +875,43 @@ def edit_lesson_action_keyboard(d: date, idx: int, entry: dict) -> InlineKeyboar
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+REMINDER_PRESETS = [5, 10, 15, 20, 30, 45, 60]
+
+
 def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     user = db.get_user(chat_id)
     on = user["reminders_on"] if user else True
-    minutes = user["reminder_minutes"] if user else 15
+    offsets = set(db.get_reminder_offsets(chat_id))
     tomorrow_on = user["tomorrow_on"] if user else False
     announcements_on = user["announcements_on"] if user else True
-    rows = [
-        [
-            InlineKeyboardButton(text=("✅ 5 хв" if minutes == 5 else "5 хв"), callback_data="setmin:5"),
-            InlineKeyboardButton(text=("✅ 15 хв" if minutes == 15 else "15 хв"), callback_data="setmin:15"),
-            InlineKeyboardButton(text=("✅ 30 хв" if minutes == 30 else "30 хв"), callback_data="setmin:30"),
-        ],
-        [InlineKeyboardButton(text=("🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування"),
-                               callback_data="toggle_reminders")],
-        [InlineKeyboardButton(
-            text=("✅ Розклад на завтра" if tomorrow_on else "📅 Розклад на завтра: вимкнено"),
-            callback_data="toggle_tomorrow",
-        )],
-        [InlineKeyboardButton(
-            text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
-            callback_data="toggle_announcements",
-        )],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
-    ]
+
+    rows = []
+    preset_row = []
+    for m in REMINDER_PRESETS:
+        text = f"✅ {m} хв" if m in offsets else f"{m} хв"
+        preset_row.append(InlineKeyboardButton(text=text, callback_data=f"togglemin:{m}"))
+        if len(preset_row) == 4:
+            rows.append(preset_row)
+            preset_row = []
+    if preset_row:
+        rows.append(preset_row)
+
+    custom_offsets = sorted((o for o in offsets if o not in REMINDER_PRESETS), reverse=True)
+    if custom_offsets:
+        rows.append([InlineKeyboardButton(text=f"✅ {m} хв ✕", callback_data=f"togglemin:{m}") for m in custom_offsets])
+
+    rows.append([InlineKeyboardButton(text="✏️ Свій варіант (хв)", callback_data="custom_min")])
+    rows.append([InlineKeyboardButton(text=("🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування"),
+                                       callback_data="toggle_reminders")])
+    rows.append([InlineKeyboardButton(
+        text=("✅ Розклад на завтра" if tomorrow_on else "📅 Розклад на завтра: вимкнено"),
+        callback_data="toggle_tomorrow",
+    )])
+    rows.append([InlineKeyboardButton(
+        text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
+        callback_data="toggle_announcements",
+    )])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -935,7 +952,9 @@ async def cb_settings_menu(callback: CallbackQuery):
         await callback.answer("Спершу обери групу", show_alert=True)
         return
     await callback.message.edit_text(
-        "⚙️ <b>Налаштування</b>\n\nОбери, які повідомлення хочеш отримувати:",
+        "⚙️ <b>Налаштування</b>\n\n"
+        "Нагадування — можна обрати кілька рубежів одразу (напр. 15, 10 і 5 хв), "
+        "додати свій варіант хвилин, або вимкнути зовсім:",
         reply_markup=reminders_keyboard(callback.from_user.id),
     )
     await callback.answer()
@@ -1790,12 +1809,46 @@ async def cb_zoom_info(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("setmin:"))
-async def cb_setmin(callback: CallbackQuery):
+@dp.callback_query(F.data.startswith("togglemin:"))
+async def cb_togglemin(callback: CallbackQuery):
     minutes = int(callback.data.split(":", 1)[1])
-    db.set_reminder_minutes(callback.from_user.id, minutes)
+    offsets = db.get_reminder_offsets(callback.from_user.id)
+    if minutes in offsets:
+        if len(offsets) == 1:
+            await callback.answer(
+                "Має лишитись хоча б одне нагадування. Щоб вимкнути всі — "
+                "«🔕 Вимкнути нагадування» нижче.",
+                show_alert=True,
+            )
+            return
+        db.remove_reminder_offset(callback.from_user.id, minutes)
+        await callback.answer(f"Нагадування за {minutes} хв прибрано")
+    else:
+        db.add_reminder_offset(callback.from_user.id, minutes)
+        await callback.answer(f"Додано нагадування за {minutes} хв ✅")
     await callback.message.edit_reply_markup(reply_markup=reminders_keyboard(callback.from_user.id))
-    await callback.answer(f"Нагадування за {minutes} хв ✅")
+
+
+@dp.callback_query(F.data == "custom_min")
+async def cb_custom_min(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(ReminderState.waiting_custom_minutes)
+    await callback.message.answer("За скільки хвилин до пари нагадати? Напиши число (1–180).")
+    await callback.answer()
+
+
+@dp.message(StateFilter(ReminderState.waiting_custom_minutes))
+async def custom_min_received(message: Message, state: FSMContext):
+    text = message.text.strip()
+    if not text.isdigit() or not (1 <= int(text) <= 180):
+        await message.answer("Введи ціле число хвилин від 1 до 180, напр. <code>7</code>.")
+        return
+    minutes = int(text)
+    await state.clear()
+    db.add_reminder_offset(message.from_user.id, minutes)
+    await message.answer(
+        f"Додано нагадування за {minutes} хв ✅",
+        reply_markup=reminders_keyboard(message.from_user.id),
+    )
 
 
 @dp.callback_query(F.data == "toggle_reminders")
@@ -2006,7 +2059,10 @@ async def check_reminders():
         # користувача/групи не заважає надіслати нагадування решті.
         try:
             group = user["group"]
-            lead = user["reminder_minutes"]
+            # Кілька офсетів на користувача (напр. [15, 10, 5]) — кожен
+            # перевіряється й позначається "надіслано" окремо, тож людина
+            # отримає нагадування на кожному обраному рубежі, а не лише раз.
+            offsets = db.get_reminder_offsets(user["chat_id"]) or [15]
             for entry in build_day_entries(user["chat_id"], group, today):
                 if entry.get("cancelled"):
                     continue
@@ -2015,25 +2071,36 @@ async def check_reminders():
                     continue
                 start_dt = datetime.combine(today, start, tzinfo=KYIV_TZ)
                 minutes_until = (start_dt - now).total_seconds() / 60
-                if not (-GRACE_MINUTES <= minutes_until <= lead):
-                    continue
-                key = entry["note_key"]
-                if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
-                    continue
-                if minutes_until > 0:
-                    text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
-                else:
-                    text = (
-                        f"⏰ Пара вже почалась {abs(int(minutes_until))} хв тому "
-                        f"(затримка пінгу):\n\n{format_entry(entry)}"
-                    )
-                try:
-                    await bot.send_message(user["chat_id"], text)
-                    reminders_sent += 1
-                except Exception:
-                    log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
-                    errors += 1
-                db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
+
+                for offset in offsets:
+                    if not (-GRACE_MINUTES <= minutes_until <= offset):
+                        continue
+                    # Окремий ключ на кожен офсет — інакше надсилання за
+                    # 15 хв позначило б "вже нагадали" й для рубежів 10/5 хв.
+                    key = f"{entry['note_key']}@{offset}"
+                    if db.was_reminder_sent(user["chat_id"], key, today.isoformat()):
+                        continue
+                    if minutes_until > 0:
+                        text = f"⏰ Через {int(minutes_until)} хв:\n\n{format_entry(entry)}"
+                    else:
+                        text = (
+                            f"⏰ Пара вже почалась {abs(int(minutes_until))} хв тому "
+                            f"(затримка пінгу):\n\n{format_entry(entry)}"
+                        )
+                    zoom_keyboard = None
+                    found = find_zoom(entry.get("teacher"))
+                    if found:
+                        _surname, info = found
+                        zoom_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🎥 Приєднатись до Zoom", url=info["link"])
+                        ]])
+                    try:
+                        await bot.send_message(user["chat_id"], text, reply_markup=zoom_keyboard)
+                        reminders_sent += 1
+                    except Exception:
+                        log.exception("Не вдалось надіслати нагадування %s", user["chat_id"])
+                        errors += 1
+                    db.mark_reminder_sent(user["chat_id"], key, today.isoformat())
         except Exception:
             log.exception(
                 "Збій обробки нагадувань для chat_id=%s (група=%s) — інші користувачі не постраждали",
