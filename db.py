@@ -108,6 +108,13 @@ CREATE TABLE IF NOT EXISTS reminder_offsets (
     minutes INTEGER NOT NULL,
     PRIMARY KEY (chat_id, minutes)
 );
+
+CREATE TABLE IF NOT EXISTS changelog (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -386,6 +393,16 @@ def users_in_group(group_name: str):
     return [r[0] for r in rows]
 
 
+def all_registered_chat_ids():
+    """Геть усі, хто хоч раз обрав групу — незалежно від групи чи
+    налаштувань нагадувань/оголошень. Для розсилки новин про сам бот
+    (changelog), а не про розклад конкретної групи."""
+    conn = _connect()
+    rows = conn.execute("SELECT chat_id FROM users").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
 def announcement_users_in_group(group_name: str):
     conn = _connect()
     rows = conn.execute(
@@ -468,6 +485,28 @@ def delete_material(material_id: int):
     conn.execute("DELETE FROM materials WHERE id = ?", (material_id,))
     conn.commit()
     conn.close()
+
+
+# ------------------------------------------------------------- changelog
+
+
+def add_changelog_entry(text: str, created_by: int):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO changelog (text, created_by, created_at) VALUES (?, ?, ?)",
+        (text, created_by, _today_kyiv().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def recent_changelog(limit: int = 10):
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, text, created_at FROM changelog ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "text": r[1], "created_at": r[2]} for r in rows]
 
 
 # ------------------------------------------------------------- overrides
