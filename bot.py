@@ -2069,7 +2069,25 @@ _last_cron_run: dict = {
 }
 
 
+_check_reminders_lock = asyncio.Lock()
+
+
 async def check_reminders():
+    # Якщо задіяно кілька зовнішніх пінгерів одночасно (cron-job.org +
+    # GitHub Actions як резерв), два запити можуть прийти майже одночасно.
+    # Без блокування обидва паралельно прочитали б "ще не надіслано" ДО
+    # того, як перший встиг би позначити надіслане в базі — і людина
+    # отримала б однакове нагадування двічі. Якщо перевірка вже триває,
+    # другий виклик просто пропускається: наступний пінг (за кілька
+    # хвилин) і так покриє актуальний стан.
+    if _check_reminders_lock.locked():
+        log.info("check_reminders() вже виконується — пропускаю паралельний виклик")
+        return
+    async with _check_reminders_lock:
+        await _check_reminders_impl()
+
+
+async def _check_reminders_impl():
     now = now_kyiv()
     today = now.date()
 
@@ -2122,12 +2140,18 @@ async def check_reminders():
                 if not due_offsets:
                     continue
 
-                minutes_display = round(minutes_until)
                 if minutes_until > 0:
+                    # Показуємо САМ НАЛАШТОВАНИЙ рубіж (напр. 15), а не сирий
+                    # live-відлік — бо той залежить від випадкового моменту
+                    # перевірки (cron раз/хв — поріг "15 хв" може бути
+                    # пійманий десь між 15.0 і 14.0, і тоді жива хвилина
+                    # показала б "14" замість очікуваних "15"). Якщо кілька
+                    # рубежів зійшлись одночасно — беремо найближчий (менший).
+                    minutes_display = min(due_offsets)
                     text = f"⏰ Через {minutes_display} хв:\n\n{format_entry(entry)}"
                 else:
                     text = (
-                        f"⏰ Пара вже почалась {abs(minutes_display)} хв тому "
+                        f"⏰ Пара вже почалась {abs(round(minutes_until))} хв тому "
                         f"(затримка пінгу):\n\n{format_entry(entry)}"
                     )
                 zoom_keyboard = None
