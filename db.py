@@ -118,6 +118,11 @@ CREATE TABLE IF NOT EXISTS changelog (
     created_by INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
 
 
@@ -185,6 +190,44 @@ def init_db():
     )
     conn.commit()
     conn.close()
+
+
+# --------------------------------------------------------- глобальні налаштування
+#
+# Один спільний key-value стіл для перемикачів "на весь бот" (а не на одного
+# користувача) — щоб не заводити окрему табличку під кожен майбутній тумблер.
+# zoom_in_reminders — типовий приклад: коли група навчається очно, лінк на
+# Zoom у нагадуванні перед парою просто не потрібен, а коли знову перейдуть
+# на дистанційне — вмикається назад тим самим перемикачем, без деплою коду.
+
+
+def get_setting(key: str, default: str | None = None) -> str | None:
+    conn = _connect()
+    row = conn.execute("SELECT value FROM bot_settings WHERE key = ?", (key,)).fetchone()
+    conn.close()
+    return row[0] if row else default
+
+
+def set_setting(key: str, value: str):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+    conn.commit()
+    conn.close()
+
+
+def zoom_in_reminders_enabled() -> bool:
+    """Увімкнено за замовчуванням (як і було раніше, до появи перемикача) —
+    відсутність запису в bot_settings означає "ще ніхто не чіпав", а не
+    "вимкнено"."""
+    return get_setting("zoom_in_reminders", "1") == "1"
+
+
+def set_zoom_in_reminders(on: bool):
+    set_setting("zoom_in_reminders", "1" if on else "0")
 
 
 def set_group(chat_id: int, group_name: str):
