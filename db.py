@@ -123,6 +123,25 @@ CREATE TABLE IF NOT EXISTS bot_settings (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS students (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    order_no INTEGER NOT NULL,
+    full_name TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS attendance_marks (
+    group_name TEXT NOT NULL,
+    date TEXT NOT NULL,
+    lesson_key TEXT NOT NULL,
+    lesson_label TEXT NOT NULL,
+    student_id INTEGER NOT NULL,
+    mark TEXT NOT NULL,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (group_name, date, lesson_key, student_id)
+);
 """
 
 
@@ -767,3 +786,106 @@ def replace_imported_individual_lessons(chat_id: int, lessons: list[dict]):
         )
     conn.commit()
     conn.close()
+
+
+# ------------------------------------------------------------- відвідування
+#
+# students       — список студентів по групі (завантажується адміном з
+#                   excel-файлу журналу; при повторному завантаженні для тієї
+#                   ж групи список повністю замінюється, щоб не накопичувати
+#                   дублі, якщо хтось вибув чи додався).
+# attendance_marks — відмітки "нема/хв/..." по кожному студенту на конкретну
+#                   пару конкретного дня. lesson_key — стабільний ідентифікатор
+#                   пари в межах дня (напр. "b:1" — базова пара №1, "o:5" —
+#                   позачергова пара з override id=5), той самий, що й
+#                   entry["id"] у build_day_entries()/group_entries_for_edit()
+#                   в bot.py. PRIMARY KEY на (group, date, lesson_key, student)
+#                   — повторна відмітка того самого студента просто оновлює
+#                   попередню (ON CONFLICT), а не плодить рядки.
+
+
+def replace_group_students(group_name: str, full_names: list[str]):
+    """Повністю замінює список студентів групи (порядок = порядок у списку,
+    order_no проставляється по порядку від 1). Старі відмітки відвідування
+    НЕ чіпаються — вони прив'язані до student_id, який зберігається лише
+    для студентів, що лишились під тим самим ім'ям на тому самому місці;
+    якщо список суттєво міняється, старі відмітки просто перестануть
+    з'являтись у виборі (посилання на видалений student_id)."""
+    conn = _connect()
+    conn.execute("DELETE FROM students WHERE group_name = ?", (group_name,))
+    for i, full_name in enumerate(full_names, start=1):
+        conn.execute(
+            "INSERT INTO students (group_name, order_no, full_name) VALUES (?, ?, ?)",
+            (group_name, i, full_name),
+        )
+    conn.commit()
+    conn.close()
+
+
+def students_for_group(group_name: str) -> list:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, order_no, full_name FROM students WHERE group_name = ? ORDER BY order_no",
+        (group_name,),
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "order_no": r[1], "full_name": r[2]} for r in rows]
+
+
+def groups_with_students() -> list:
+    conn = _connect()
+    rows = conn.execute("SELECT DISTINCT group_name FROM students ORDER BY group_name").fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+
+def set_attendance_mark(
+    group_name: str, date_str: str, lesson_key: str, lesson_label: str, student_id: int, mark: str, created_by: int
+):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO attendance_marks "
+        "(group_name, date, lesson_key, lesson_label, student_id, mark, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(group_name, date, lesson_key, student_id) "
+        "DO UPDATE SET mark = excluded.mark, created_by = excluded.created_by, created_at = excluded.created_at",
+        (group_name, date_str, lesson_key, lesson_label, student_id, mark, created_by, _today_kyiv().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def clear_attendance_mark(group_name: str, date_str: str, lesson_key: str, student_id: int):
+    conn = _connect()
+    conn.execute(
+        "DELETE FROM attendance_marks WHERE group_name = ? AND date = ? AND lesson_key = ? AND student_id = ?",
+        (group_name, date_str, lesson_key, student_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def attendance_marks_for_lesson(group_name: str, date_str: str, lesson_key: str) -> dict:
+    """{student_id: mark} для однієї пари одного дня."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT student_id, mark FROM attendance_marks WHERE group_name = ? AND date = ? AND lesson_key = ?",
+        (group_name, date_str, lesson_key),
+    ).fetchall()
+    conn.close()
+    return {r[0]: r[1] for r in rows}
+
+
+def attendance_marks_for_date(group_name: str, date_str: str) -> dict:
+    """{lesson_key: {student_id: mark}} — усі відмітки групи за день одразу,
+    для генерації excel-файлу (один запит замість одного на кожну пару)."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT lesson_key, student_id, mark FROM attendance_marks WHERE group_name = ? AND date = ?",
+        (group_name, date_str),
+    ).fetchall()
+    conn.close()
+    result: dict = {}
+    for lesson_key, student_id, mark in rows:
+        result.setdefault(lesson_key, {})[student_id] = mark
+    return result
