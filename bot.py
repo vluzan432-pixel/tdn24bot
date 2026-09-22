@@ -41,6 +41,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -48,7 +49,9 @@ from aiogram.types import (
 )
 from aiohttp import web
 from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 import db
 from schedule_data import (
@@ -79,9 +82,10 @@ PORT = int(os.environ.get("PORT", 10000))
 # групи. Свій id можна дізнатись командою /whoami після першого /start.
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
 
-PERMISSIONS = {"schedule", "announce", "materials", "polls"}
+PERMISSIONS = {"schedule", "announce", "materials", "polls", "attendance"}
 PERMISSION_LABELS = {
     "schedule": "розклад", "announce": "оголошення", "materials": "матеріали", "polls": "опитування",
+    "attendance": "відвідування",
 }
 
 
@@ -128,6 +132,11 @@ class MaterialState(StatesGroup):
     waiting_subject = State()
     waiting_title = State()
     waiting_content = State()
+
+
+class AttendanceState(StatesGroup):
+    waiting_roster_file = State()
+    waiting_roster_group_name = State()
 
 
 CHANGE_FIELDS = [
@@ -777,6 +786,7 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🗓 Найближчі семінари / практичні / ПК", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
         [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
+        [InlineKeyboardButton(text="📋 Відвідування 🔒", callback_data="att_menu")],
         [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
         [InlineKeyboardButton(text="✏️ Редагувати розклад", callback_data="edit_menu")],
         [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
@@ -1462,6 +1472,521 @@ async def cb_ind_del(callback: CallbackQuery):
     await callback.answer()
 
 
+# ================================================================== ВІДВІДУВАННЯ
+#
+# Права: "attendance" (див. PERMISSIONS/PERMISSION_LABELS вище). Два кроки:
+#   1. Адмін одноразово (і далі за потреби) заливає excel зі списком
+#      студентів групи — той самий журнал, що зазвичай ведеться вручну
+#      (колонка "Прізвище та ініціали студентів", група в клітинці A2).
+#      Можна кілька аркушів/груп в одному файлі.
+#   2. Далі "📝 Відмітити відсутніх" → група → дата → пара → тап на студента
+#      циклічно міняє відмітку (порожньо → н → хв → нб → сп → вп → нп → порожньо),
+#      і "📄 Згенерувати Excel" одразу шле готовий файл журналу за цей день.
+#
+# Навмисно НЕ використовує FSMContext для самого проставляння відміток —
+# усе (група/дата/пара/студент) кодується прямо в callback_data через "~",
+# щоб довга сесія розмітки не залежала від пам'яті процесу (FSM тут
+# MemoryStorage і губиться, якщо безкоштовний Render засне й перезапуститься
+# між натисканнями).
+
+ATT_MARK_CYCLE = ["", "н", "хв", "нб", "сп", "вп", "нп"]
+ATT_MARK_NAMES = {"н": "Н", "хв": "ХВ", "нб": "НБ", "сп": "СП", "вп": "ВП", "нп": "НП"}
+ATT_MARK_EMOJI = {"": "⬜", "н": "❌", "хв": "🤒", "нб": "❌", "сп": "⏰", "вп": "🏖", "нп": "📋"}
+ATT_LEGEND_LINES = [
+    "Позначення:",
+    "нп - поважна причина",
+    "н, нб - відсутній",
+    "хв - відсутній по хворобі",
+    "сп - запізнення",
+    "вп - відпустка",
+]
+
+
+def att_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="📥 Завантажити список студентів", callback_data="att_roster")],
+        [InlineKeyboardButton(text="📝 Відмітити відсутніх", callback_data="att_mark_groups")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def att_lessons_for_day(group: str, d: date) -> list:
+    """Пари групи на день (з урахуванням правок/скасувань), без скасованих —
+    відмічати відвідування на скасованій парі немає сенсу."""
+    return [e for e in group_entries_for_edit(group, d) if not e.get("cancelled")]
+
+
+def _att_find_entry(group: str, d: date, entry_id: str):
+    for e in att_lessons_for_day(group, d):
+        if e["id"] == entry_id:
+            return e
+    return None
+
+
+def _att_entry_label(entry: dict) -> str:
+    subj = (entry.get("subject") or "").strip()
+    teacher = (entry.get("teacher") or "").strip()
+    label = f"Пара {entry.get('pair', '')} · {subj}"
+    if teacher:
+        label += f" ({teacher})"
+    return label
+
+
+def att_date_keyboard(group: str) -> InlineKeyboardMarkup:
+    today = today_kyiv()
+    yesterday = today - timedelta(days=1)
+    rows = [
+        [InlineKeyboardButton(
+            text=f"📅 Сьогодні ({today.strftime('%d.%m')})",
+            callback_data=f"attday~{group}~{today.isoformat()}",
+        )],
+        [InlineKeyboardButton(
+            text=f"📅 Вчора ({yesterday.strftime('%d.%m')})",
+            callback_data=f"attday~{group}~{yesterday.isoformat()}",
+        )],
+        [InlineKeyboardButton(text="📆 Інша дата", callback_data=f"attcal~{group}~{today.year}-{today.month:02d}")],
+        [InlineKeyboardButton(text="🔙 Групи", callback_data="att_mark_groups")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def att_calendar_keyboard(group: str, year: int, month: int) -> InlineKeyboardMarkup:
+    today = today_kyiv()
+    weeks = calendar_module.Calendar(firstweekday=0).monthdatescalendar(year, month)
+    rows = [[InlineKeyboardButton(text=d, callback_data="noop") for d in ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Нд"]]]
+    for week in weeks:
+        row = []
+        for day_date in week:
+            if day_date.month != month:
+                row.append(InlineKeyboardButton(text=" ", callback_data="noop"))
+            else:
+                label = f"·{day_date.day}·" if day_date == today else str(day_date.day)
+                row.append(InlineKeyboardButton(text=label, callback_data=f"attday~{group}~{day_date.isoformat()}"))
+        rows.append(row)
+    prev_m = _add_months(date(year, month, 1), -1)
+    next_m = _add_months(date(year, month, 1), 1)
+    rows.append([
+        InlineKeyboardButton(text="◀", callback_data=f"attcal~{group}~{prev_m.year}-{prev_m.month:02d}"),
+        InlineKeyboardButton(text=f"{MONTH_NAMES_UA[month]} {year}", callback_data="noop"),
+        InlineKeyboardButton(text="▶", callback_data=f"attcal~{group}~{next_m.year}-{next_m.month:02d}"),
+    ])
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data=f"attg~{group}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def att_day_keyboard(group: str, d: date, lessons: list) -> InlineKeyboardMarkup:
+    marks = db.attendance_marks_for_date(group, d.isoformat())
+    rows = []
+    for entry in lessons:
+        marked = marks.get(entry["id"], {})
+        subj = (entry.get("subject") or "").strip()
+        label = f"{entry.get('pair', '')} · {subj[:28]}"
+        if marked:
+            label += f" — {len(marked)} відс."
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"attless~{group}~{d.isoformat()}~{entry['id']}")])
+    rows.append([InlineKeyboardButton(text="📄 Згенерувати Excel", callback_data=f"attexport~{group}~{d.isoformat()}")])
+    rows.append([InlineKeyboardButton(text="🔙 Інша дата", callback_data=f"attg~{group}")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="att_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def att_lesson_students_keyboard(group: str, iso: str, entry_id: str) -> InlineKeyboardMarkup:
+    students = db.students_for_group(group)
+    current = db.attendance_marks_for_lesson(group, iso, entry_id)
+    rows = []
+    for s in students:
+        mark = current.get(s["id"], "")
+        prefix = ATT_MARK_EMOJI.get(mark, "⬜")
+        suffix = f" [{ATT_MARK_NAMES[mark]}]" if mark else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{prefix} {s['full_name']}{suffix}",
+            callback_data=f"attstud~{group}~{iso}~{entry_id}~{s['id']}",
+        )])
+    rows.append([InlineKeyboardButton(text="🔙 До пар", callback_data=f"attday~{group}~{iso}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _parse_roster_sheet(ws) -> list:
+    """Шукає рядок-заголовок з "Прізвище" й колонку з ПІБ; далі читає рядки,
+    доки колонка не спорожніє або не почнеться "Усього.../Позначення:"
+    (службові рядки внизу оригінального журналу)."""
+    header_row = None
+    name_col = None
+    for row in ws.iter_rows(min_row=1, max_row=min(10, ws.max_row or 1)):
+        for cell in row:
+            if cell.value and "прізвище" in str(cell.value).strip().lower():
+                header_row, name_col = cell.row, cell.column
+                break
+        if header_row:
+            break
+    if not name_col:
+        header_row, name_col = 4, 2  # запасний варіант — типовий шаблон деканату
+
+    # Між заголовком і першим студентом часто є ще один службовий рядок
+    # (напр. "Дата" з датами занять) — тому спершу пропускаємо порожні
+    # клітинки в колонці ПІБ, і лише після першого непорожнього значення
+    # трактуємо наступну порожню клітинку як кінець списку.
+    names = []
+    started = False
+    for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row or header_row + 1):
+        cell = row[name_col - 1]
+        text = str(cell.value).strip() if cell.value is not None else ""
+        if not text:
+            if started:
+                break
+            continue
+        low = text.lower()
+        if low.startswith("усього") or low.startswith("позначен"):
+            break
+        started = True
+        names.append(text)
+    return names
+
+
+def parse_roster_workbook(data: bytes) -> dict:
+    """{група: [ПІБ, ...]} з можливо кількох аркушів. Назву групи бере з
+    клітинки A2 (як в оригінальному журналі), інакше — назву аркуша."""
+    wb = load_workbook(io.BytesIO(data), data_only=True)
+    result: dict = {}
+    for ws in wb.worksheets:
+        names = _parse_roster_sheet(ws)
+        if not names:
+            continue
+        group_val = ws.cell(row=2, column=1).value
+        group = str(group_val).strip() if group_val and str(group_val).strip() else ws.title
+        bucket = result.setdefault(group, [])
+        for n in names:
+            if n not in bucket:
+                bucket.append(n)
+    return result
+
+
+def build_attendance_excel(group: str, d: date, lessons: list, students: list, marks: dict) -> bytes:
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Відвідування"
+
+    thin = Side(style="thin", color="999999")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    header_font = Font(name="Arial", size=10, bold=True)
+    normal_font = Font(name="Arial", size=10)
+    header_fill = PatternFill("solid", fgColor="DDEBF7")
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    left_align = Alignment(horizontal="left", vertical="center", wrap_text=True)
+
+    last_col = max(3, 2 + len(lessons))
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    title = ws.cell(
+        row=1, column=1,
+        value=f"Журнал відвідувань — група {group} — {d.strftime('%d.%m.%Y')} ({DAY_NAMES[d.weekday()]})",
+    )
+    title.font = Font(name="Arial", size=12, bold=True)
+
+    header_row = 3
+    ws.merge_cells(start_row=header_row, start_column=1, end_row=header_row + 1, end_column=1)
+    ws.merge_cells(start_row=header_row, start_column=2, end_row=header_row + 1, end_column=2)
+    ws.cell(row=header_row, column=1, value="№")
+    ws.cell(row=header_row, column=2, value="Прізвище та ініціали студентів")
+
+    for i, entry in enumerate(lessons):
+        col = 3 + i
+        subj = (entry.get("subject") or "").strip()
+        teacher = (entry.get("teacher") or "").strip()
+        room = (entry.get("room") or "").strip()
+        header_lines = [f"Пара {entry.get('pair', '')} · {entry.get('time', '')}", subj]
+        if teacher:
+            header_lines.append(teacher)
+        ws.cell(row=header_row, column=col, value="\n".join(header_lines))
+        ws.cell(row=header_row + 1, column=col, value=f"Ауд. {room}" if room else "")
+
+    for col in range(1, last_col + 1):
+        for r in (header_row, header_row + 1):
+            c = ws.cell(row=r, column=col)
+            c.font = header_font
+            c.alignment = center
+            c.fill = header_fill
+            c.border = border
+
+    first_data_row = header_row + 2
+    for row_i, student in enumerate(students):
+        row = first_data_row + row_i
+        num_cell = ws.cell(row=row, column=1, value=row_i + 1)
+        name_cell = ws.cell(row=row, column=2, value=student["full_name"])
+        num_cell.font = normal_font
+        num_cell.alignment = center
+        num_cell.border = border
+        name_cell.font = normal_font
+        name_cell.alignment = left_align
+        name_cell.border = border
+        for i, entry in enumerate(lessons):
+            col = 3 + i
+            mark = marks.get(entry["id"], {}).get(student["id"], "")
+            cell = ws.cell(row=row, column=col, value=mark or None)
+            cell.font = normal_font
+            cell.alignment = center
+            cell.border = border
+
+    total_row = first_data_row + len(students)
+    ws.cell(row=total_row, column=2, value="Усього відсутніх (запізнилося)").font = header_font
+    if students:
+        first_r, last_r = first_data_row, first_data_row + len(students) - 1
+        for i in range(len(lessons)):
+            col = 3 + i
+            col_letter = get_column_letter(col)
+            cell = ws.cell(row=total_row, column=col, value=f'=COUNTIF({col_letter}{first_r}:{col_letter}{last_r},"<>")')
+            cell.font = header_font
+            cell.alignment = center
+            cell.border = border
+
+    legend_row = total_row + 2
+    for i, line in enumerate(ATT_LEGEND_LINES):
+        c = ws.cell(row=legend_row + i, column=2, value=line)
+        c.font = header_font if i == 0 else normal_font
+
+    ws.column_dimensions["A"].width = 5
+    ws.column_dimensions["B"].width = 32
+    for i in range(len(lessons)):
+        ws.column_dimensions[get_column_letter(3 + i)].width = 20
+    ws.row_dimensions[header_row].height = 48
+    ws.freeze_panes = ws.cell(row=first_data_row, column=3).coordinate
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
+@dp.callback_query(F.data == "att_menu")
+async def cb_att_menu(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text("📋 <b>Відвідування</b>\n\nОбери дію:", reply_markup=att_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "att_roster")
+async def cb_att_roster(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    await state.clear()
+    await state.set_state(AttendanceState.waiting_roster_file)
+    await callback.message.answer(
+        "Надішли Excel-файл (.xlsx) зі списком студентів — журнал у звичному вигляді: "
+        "колонка «Прізвище та ініціали студентів», назва групи в клітинці A2.\n"
+        "Можна кілька аркушів з різними групами в одному файлі — заберу всі."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(AttendanceState.waiting_roster_file), F.document)
+async def att_roster_file_received(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "attendance"):
+        await state.clear()
+        return
+    document = message.document
+    filename = (document.file_name or "").lower()
+    if not filename.endswith(".xlsx"):
+        await message.answer(
+            "Потрібен файл .xlsx. Якщо це .xls — відкрий в Excel і збережи як «Excel Workbook (.xlsx)»."
+        )
+        return
+    if document.file_size and document.file_size > 5 * 1024 * 1024:
+        await message.answer("Файл завеликий. Надішли до 5 МБ.")
+        return
+    try:
+        downloaded = await bot.download(document)
+        groups = parse_roster_workbook(downloaded.read())
+    except Exception:
+        log.exception("Не вдалось прочитати файл зі списком студентів")
+        await message.answer("Не зміг прочитати цей файл. Переконайся, що структура як у зразку, і спробуй ще раз.")
+        return
+    if not groups:
+        await message.answer(
+            "Не знайшов жодного студента. Перевір, що є колонка «Прізвище та ініціали студентів»."
+        )
+        return
+    await state.update_data(roster_groups=groups)
+    lines = ["📥 <b>Знайдено:</b>"]
+    for group, names in groups.items():
+        lines.append(f"• {html.escape(group)} — {len(names)} студент(ів)")
+    lines.append("\n⚠️ Це <b>повністю замінить</b> поточний список студентів цих груп, якщо він уже був.\nЗберегти?")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Зберегти", callback_data="att_roster_confirm")],
+        [InlineKeyboardButton(text="❌ Скасувати", callback_data="att_roster_cancel")],
+    ])
+    await message.answer("\n".join(lines), reply_markup=keyboard)
+
+
+@dp.message(StateFilter(AttendanceState.waiting_roster_file))
+async def att_roster_file_waiting(message: Message):
+    await message.answer("Надішли саме Excel-файл (.xlsx), або /start щоб скасувати.")
+
+
+@dp.callback_query(F.data == "att_roster_confirm")
+async def cb_att_roster_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    groups = data.get("roster_groups")
+    if not groups:
+        await callback.answer("Дані застаріли — завантаж файл ще раз.", show_alert=True)
+        return
+    for group, names in groups.items():
+        db.replace_group_students(group, names)
+    await state.clear()
+    total = sum(len(v) for v in groups.values())
+    await callback.message.edit_text(
+        f"Збережено ✅ {len(groups)} груп(и), {total} студентів.",
+        reply_markup=att_menu_keyboard(),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "att_roster_cancel")
+async def cb_att_roster_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Скасовано.", reply_markup=att_menu_keyboard())
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "att_mark_groups")
+async def cb_att_mark_groups(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    groups = db.groups_with_students()
+    if not groups:
+        await callback.answer("Спершу завантаж список студентів хоч однієї групи.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=g, callback_data=f"attg~{g}")] for g in groups]
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="att_menu")])
+    await callback.message.edit_text("Обери групу:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attg~"))
+async def cb_attg(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    group = callback.data.split("~", 1)[1]
+    await callback.message.edit_text(f"Група {html.escape(group)}. Обери дату:", reply_markup=att_date_keyboard(group))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attcal~"))
+async def cb_attcal(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    _, group, ym = callback.data.split("~", 2)
+    year_s, month_s = ym.split("-")
+    await callback.message.edit_text(
+        f"Група {html.escape(group)}. Обери дату:",
+        reply_markup=att_calendar_keyboard(group, int(year_s), int(month_s)),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attday~"))
+async def cb_attday(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    _, group, iso = callback.data.split("~", 2)
+    d = date.fromisoformat(iso)
+    if not db.students_for_group(group):
+        await callback.answer("У групи ще немає списку студентів — спершу завантаж excel.", show_alert=True)
+        return
+    lessons = att_lessons_for_day(group, d)
+    if not lessons:
+        await callback.message.edit_text(
+            f"На {d.strftime('%d.%m.%Y')} ({DAY_NAMES[d.weekday()]}) у групи {html.escape(group)} пар немає.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔙 Інша дата", callback_data=f"attg~{group}")],
+                [InlineKeyboardButton(text="🏠 Меню", callback_data="att_menu")],
+            ]),
+        )
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        f"📅 {d.strftime('%d.%m.%Y')} ({DAY_NAMES[d.weekday()]}), група {html.escape(group)}\nОбери пару:",
+        reply_markup=att_day_keyboard(group, d, lessons),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attless~"))
+async def cb_attless(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    _, group, iso, entry_id = callback.data.split("~", 3)
+    if not db.students_for_group(group):
+        await callback.answer("У групи ще немає списку студентів.", show_alert=True)
+        return
+    d = date.fromisoformat(iso)
+    entry = _att_find_entry(group, d, entry_id)
+    label = _att_entry_label(entry) if entry else entry_id
+    await callback.message.edit_text(
+        f"📅 {d.strftime('%d.%m.%Y')} · {html.escape(label)}\nНатисни на студента, щоб змінити відмітку "
+        "(порожньо → н → хв → нб → сп → вп → нп → порожньо):",
+        reply_markup=att_lesson_students_keyboard(group, iso, entry_id),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attstud~"))
+async def cb_attstud(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    _, group, iso, entry_id, student_id_s = callback.data.split("~", 4)
+    student_id = int(student_id_s)
+    current = db.attendance_marks_for_lesson(group, iso, entry_id).get(student_id, "")
+    next_mark = ATT_MARK_CYCLE[(ATT_MARK_CYCLE.index(current) + 1) % len(ATT_MARK_CYCLE)]
+    d = date.fromisoformat(iso)
+    entry = _att_find_entry(group, d, entry_id)
+    label = _att_entry_label(entry) if entry else entry_id
+    if next_mark:
+        db.set_attendance_mark(group, iso, entry_id, label, student_id, next_mark, callback.from_user.id)
+    else:
+        db.clear_attendance_mark(group, iso, entry_id, student_id)
+    await callback.message.edit_reply_markup(reply_markup=att_lesson_students_keyboard(group, iso, entry_id))
+    await callback.answer(ATT_MARK_NAMES.get(next_mark, "присутній"))
+
+
+@dp.callback_query(F.data.startswith("attexport~"))
+async def cb_attexport(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    _, group, iso = callback.data.split("~", 2)
+    d = date.fromisoformat(iso)
+    students = db.students_for_group(group)
+    if not students:
+        await callback.answer("У групи ще немає списку студентів.", show_alert=True)
+        return
+    lessons = att_lessons_for_day(group, d)
+    if not lessons:
+        await callback.answer("На цей день пар немає.", show_alert=True)
+        return
+    await callback.answer("Генерую файл…")
+    marks = db.attendance_marks_for_date(group, iso)
+    try:
+        file_bytes = build_attendance_excel(group, d, lessons, students, marks)
+    except Exception:
+        log.exception("Не вдалось згенерувати excel журналу відвідувань")
+        await callback.message.answer("Не вдалось згенерувати файл. Спробуй ще раз.")
+        return
+    filename = f"Відвідування_{group}_{d.strftime('%d.%m.%Y')}.xlsx"
+    await callback.message.answer_document(
+        BufferedInputFile(file_bytes, filename=filename),
+        caption=f"📋 Журнал відвідувань — {html.escape(group)}, {d.strftime('%d.%m.%Y')} ({DAY_NAMES[d.weekday()]})",
+    )
+
+
 @dp.message(Command("group"))
 async def cmd_group(message: Message):
     await message.answer("Обери свою групу:", reply_markup=group_choice_keyboard())
@@ -1501,6 +2026,8 @@ async def cmd_admin(message: Message):
         lines.append("• <code>/materials del назва</code> — видалити матеріал за назвою (запитає уточнення, якщо збігів кілька)")
     if "polls" in rights:
         lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
+    if "attendance" in rights:
+        lines.append("• «📋 Відвідування» в головному меню — список студентів і журнал відвідувань")
     if is_owner(message.from_user.id):
         lines.append("• <code>/staff</code> — права заступників")
     await message.answer("\n".join(lines))
@@ -1542,7 +2069,7 @@ async def cmd_staff(message: Message):
         lines.append(f"• <code>{staff['chat_id']}</code> — {rights or 'без прав'}")
     lines.append(
         "\nДати права: <code>/grant ID schedule,announce</code>\n"
-        "Доступні: schedule, announce, materials, polls\n"
+        "Доступні: schedule, announce, materials, polls, attendance\n"
         "Забрати всі права: <code>/revoke ID</code>"
     )
     await message.answer("\n".join(lines))
