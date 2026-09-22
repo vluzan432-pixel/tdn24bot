@@ -142,6 +142,12 @@ CREATE TABLE IF NOT EXISTS attendance_marks (
     created_at TEXT NOT NULL,
     PRIMARY KEY (group_name, date, lesson_key, student_id)
 );
+
+CREATE TABLE IF NOT EXISTS semester_bounds (
+    group_name TEXT PRIMARY KEY,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL
+);
 """
 
 
@@ -889,3 +895,49 @@ def attendance_marks_for_date(group_name: str, date_str: str) -> dict:
     for lesson_key, student_id, mark in rows:
         result.setdefault(lesson_key, {})[student_id] = mark
     return result
+
+
+def attendance_marks_for_range(group_name: str, start_date: str, end_date: str) -> dict:
+    """{date: {lesson_key: {student_id: mark}}} — усі відмітки групи за весь
+    діапазон (семестр) одним запитом, для генерації семестрового журналу
+    (інакше довелось би робити окремий SELECT на кожен день семестру)."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT date, lesson_key, student_id, mark FROM attendance_marks "
+        "WHERE group_name = ? AND date >= ? AND date <= ?",
+        (group_name, start_date, end_date),
+    ).fetchall()
+    conn.close()
+    result: dict = {}
+    for date_str, lesson_key, student_id, mark in rows:
+        result.setdefault(date_str, {}).setdefault(lesson_key, {})[student_id] = mark
+    return result
+
+
+# semester_bounds — перший і останній день семестру для групи (потрібні саме
+# повні дати з роком: у schedules.json пари прив'язані лише до "дд.мм" без
+# року, тому щоб зібрати послідовність реальних тижнів/дат для семестрового
+# журналу, рік звідкись має задати адмін вручну, один раз на семестр).
+
+
+def set_semester_bounds(group_name: str, start_date: str, end_date: str):
+    conn = _connect()
+    conn.execute(
+        "INSERT INTO semester_bounds (group_name, start_date, end_date) VALUES (?, ?, ?) "
+        "ON CONFLICT(group_name) DO UPDATE SET start_date = excluded.start_date, end_date = excluded.end_date",
+        (group_name, start_date, end_date),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_semester_bounds(group_name: str):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT start_date, end_date FROM semester_bounds WHERE group_name = ?",
+        (group_name,),
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return {"start": row[0], "end": row[1]}
