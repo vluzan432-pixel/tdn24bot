@@ -1489,6 +1489,17 @@ async def cb_ind_del(callback: CallbackQuery):
 # MemoryStorage і губиться, якщо безкоштовний Render засне й перезапуститься
 # між натисканнями).
 
+DAY_SHORT = {
+    "Понеділок": "пн", "Вівторок": "вт", "Середа": "ср",
+    "Четвер": "чт", "П'ятниця": "пт", "Субота": "сб", "Неділя": "нд",
+}
+
+# Скільки предметних слотів (Zoom-підколонок) відводити на день у семестровому
+# журналі — стільки, скільки в оригінальному ТДН-24.xls. Якщо в конкретний
+# день пар більше — блок дня просто розширюється під фактичну кількість, щоб
+# нічого не загубити (плата за це — трохи ширші колонки того дня).
+ATT_SEMESTER_DAY_SLOTS = 4
+
 ATT_MARK_CYCLE = ["", "н", "хв", "нб", "сп", "вп", "нп"]
 ATT_MARK_NAMES = {"н": "Н", "хв": "ХВ", "нб": "НБ", "сп": "СП", "вп": "ВП", "нп": "НП"}
 ATT_MARK_EMOJI = {"": "⬜", "н": "❌", "хв": "🤒", "нб": "❌", "сп": "⏰", "вп": "🏖", "нп": "📋"}
@@ -1506,9 +1517,51 @@ def att_menu_keyboard() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📥 Завантажити список студентів", callback_data="att_roster")],
         [InlineKeyboardButton(text="📝 Відмітити відсутніх", callback_data="att_mark_groups")],
+        [InlineKeyboardButton(text="📚 Журнал за семестр (Excel)", callback_data="att_semester_groups")],
         [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.message(Command("semester"))
+async def cmd_semester(message: Message):
+    """Задає межі семестру для групи — потрібно один раз (і за потреби,
+    коли починається новий семестр). schedules.json прив'язує пари лише до
+    "дд.мм" без року, тому саме рік і сама наявність меж має задати людина."""
+    if not has_permission(message.from_user.id, "attendance"):
+        await message.answer("Для цього потрібне право <code>attendance</code> 🔒")
+        return
+    parts = message.text.split(maxsplit=3)
+    if len(parts) != 4:
+        bounds_lines = []
+        for group in GROUPS:
+            b = db.get_semester_bounds(group)
+            if b:
+                start_d = date.fromisoformat(b["start"])
+                end_d = date.fromisoformat(b["end"])
+                bounds_lines.append(f"• {group}: {start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')}")
+        current = ("\n\nЗараз задано:\n" + "\n".join(bounds_lines)) if bounds_lines else ""
+        await message.answer(
+            "Приклад: <code>/semester ТДН-24 01.09.2026 20.12.2026</code>\n"
+            "(перший і останній день семестру групи — потрібні для журналу за весь семестр)" + current
+        )
+        return
+    _, group, start_s, end_s = parts
+    try:
+        start_d = datetime.strptime(start_s, "%d.%m.%Y").date()
+        end_d = datetime.strptime(end_s, "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Дати мають бути у форматі дд.мм.рррр, напр. 01.09.2026.")
+        return
+    if end_d <= start_d:
+        await message.answer("Останній день має бути пізніше першого.")
+        return
+    db.set_semester_bounds(group, start_d.isoformat(), end_d.isoformat())
+    await message.answer(
+        f"Межі семестру для групи {html.escape(group)} збережено: "
+        f"{start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')} ✅\n"
+        f"Тепер «📚 Журнал за семестр (Excel)» у меню відвідування згенерує повний журнал за цей період."
+    )
 
 
 def att_lessons_for_day(group: str, d: date) -> list:
@@ -1756,6 +1809,220 @@ def build_attendance_excel(group: str, d: date, lessons: list, students: list, m
     return buf.getvalue()
 
 
+def semester_weeks(start_d: date, end_d: date) -> list:
+    """Список тижнів (пн-пт) між start_d і end_d включно, кожен — список
+    date. Перший/останній тиждень може бути неповним, якщо семестр
+    починається/закінчується не з понеділка/п'ятниці — зайві дні поза
+    діапазоном просто не додаються."""
+    weeks = []
+    cursor = start_d - timedelta(days=start_d.weekday())  # понеділок тижня start_d
+    while cursor <= end_d:
+        week_days = [
+            d for d in (cursor + timedelta(days=i) for i in range(5))
+            if start_d <= d <= end_d
+        ]
+        if week_days:
+            weeks.append(week_days)
+        cursor += timedelta(days=7)
+    return weeks
+
+
+def build_attendance_excel_semester(group: str, weeks: list, students: list, marks_by_date: dict) -> bytes:
+    """Журнал відвідувань за весь семестр в один аркуш (.xlsx, без ліміту
+    256 колонок старого .xls) — макет 1:1 як у ТДН-24.xls: тижні як блоки
+    колонок, у блоці тижня — по 4 колонки (слоти пар) на кожен робочий день,
+    у шапці дня — назва предмета+викладач (текст повернутий на 90°) і
+    статичний підпис "Zoom", під ними — коротка назва дня і дата (мерж на
+    решту колонок дня). Позначки студентів пишуться прямо в комірку
+    відповідного предмета/дня; підсумковий рядок — формулою COUNTIF, як і
+    в поденному журналі.
+
+    Ширина дня — ATT_SEMESTER_DAY_SLOTS (як в оригіналі), але якщо в
+    конкретний день пар фактично більше — блок цього дня розширюється, щоб
+    жодна пара не загубилась."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Відвідування"
+
+    thin = Side(style="thin", color="000000")
+    medium = Side(style="medium", color="000000")
+    thick = Side(style="thick", color="000000")
+
+    def border(left=thin, right=thin, top=thin, bottom=thin):
+        return Border(left=left, right=right, top=top, bottom=bottom)
+
+    font_group = Font(name="Arial Narrow", size=28, bold=True)
+    font_header = Font(name="Arial Narrow", size=12, bold=True)
+    font_header_small = Font(name="Arial Narrow", size=14, bold=True)
+    font_normal = Font(name="Arial Narrow", size=12)
+    font_total_label = Font(name="Arial Narrow", size=16, bold=True)
+
+    rotated = Alignment(horizontal="general", vertical="bottom", wrap_text=True, textRotation=90)
+    center = Alignment(horizontal="center", vertical="center", wrap_text=True)
+    center_no_wrap = Alignment(horizontal="center", vertical="bottom")
+    left_align = Alignment(horizontal="left", vertical="top", wrap_text=True)
+
+    ROW_WEEK, ROW_SUBJECT, ROW_ZOOM, ROW_DATE = 1, 2, 3, 4
+    first_data_row = 5
+
+    # Спершу прораховуємо ширину блоку кожного дня (>= ATT_SEMESTER_DAY_SLOTS,
+    # більше — якщо реально пар більше) і призначаємо колонки наперед, щоб
+    # писати заголовки й дані за один прохід.
+    day_plan = []  # [(d, lessons, start_col, width), ...]
+    col_cursor = 4  # A,B,C зайняті під №/ПІБ/Аудит.
+    week_col_ranges = []  # [(start_col, end_col), ...] по одному на тиждень
+    for week in weeks:
+        week_start_col = col_cursor
+        for d in week:
+            lessons = att_lessons_for_day(group, d)
+            width = max(ATT_SEMESTER_DAY_SLOTS, len(lessons))
+            day_plan.append((d, lessons, col_cursor, width))
+            col_cursor += width
+        week_col_ranges.append((week_start_col, col_cursor - 1))
+
+    last_col = max(3, col_cursor - 1)
+
+    # --- Фіксована ліва частина (№ / ПІБ / Аудит. / Дата) ---
+    ws.merge_cells(start_row=ROW_SUBJECT, start_column=1, end_row=ROW_SUBJECT, end_column=2)
+    g = ws.cell(row=ROW_SUBJECT, column=1, value=group)
+    g.font = font_group
+    g.alignment = center_no_wrap
+
+    ws.merge_cells(start_row=ROW_ZOOM, start_column=1, end_row=ROW_DATE, end_column=1)
+    ws.merge_cells(start_row=ROW_ZOOM, start_column=2, end_row=ROW_DATE, end_column=2)
+    c1 = ws.cell(row=ROW_ZOOM, column=1, value="№ з/п")
+    c1.font = font_header_small
+    c1.alignment = center
+    c2 = ws.cell(row=ROW_ZOOM, column=2, value="Прізвище та ініціали студентів")
+    c2.font = font_header_small
+    c2.alignment = center
+    c3 = ws.cell(row=ROW_ZOOM, column=3, value="Аудит.")
+    c3.font = font_header
+    c3.alignment = center
+    c4 = ws.cell(row=ROW_DATE, column=3, value="Дата")
+    c4.font = font_header
+    c4.alignment = center
+
+    # --- Заголовки тижнів (рядок 1) ---
+    for week_no, (week, (wcol_start, wcol_end)) in enumerate(zip(weeks, week_col_ranges), start=1):
+        if wcol_end > wcol_start:
+            ws.merge_cells(start_row=ROW_WEEK, start_column=wcol_start, end_row=ROW_WEEK, end_column=wcol_end)
+        wc = ws.cell(row=ROW_WEEK, column=wcol_start, value=f"Тиждень №{week_no}")
+        wc.font = font_header
+        wc.alignment = center_no_wrap
+
+    # --- Заголовки днів (рядки 2-4) + дані студентів ---
+    for d, lessons, start_col, width in day_plan:
+        day_short = DAY_SHORT.get(DAY_NAMES[d.weekday()], "")
+        for slot in range(width):
+            col = start_col + slot
+            if slot < len(lessons):
+                entry = lessons[slot]
+                subj = (entry.get("subject") or "").strip()
+                teacher = (entry.get("teacher") or "").strip()
+                subj_cell_value = f"{subj}\n({teacher})" if teacher else subj
+            else:
+                subj_cell_value = ""
+            sc = ws.cell(row=ROW_SUBJECT, column=col, value=subj_cell_value or None)
+            sc.font = font_header
+            sc.alignment = rotated
+            zc = ws.cell(row=ROW_ZOOM, column=col, value="Zoom")
+            zc.font = font_header
+            zc.alignment = Alignment(horizontal="general", vertical="bottom")
+
+        first = ws.cell(row=ROW_DATE, column=start_col, value=day_short)
+        first.font = font_header
+        first.alignment = Alignment(horizontal="general", vertical="bottom")
+        if width > 1:
+            ws.merge_cells(start_row=ROW_DATE, start_column=start_col + 1, end_row=ROW_DATE, end_column=start_col + width - 1)
+        date_cell = ws.cell(row=ROW_DATE, column=start_col + 1, value=d)
+        date_cell.number_format = "DD.MM"
+        date_cell.font = font_header
+        date_cell.alignment = center_no_wrap
+
+        # межі: медіум навколо блоку дня, товста зліва — якщо це початок тижня
+        is_week_start = any(start_col == wstart for wstart, _ in week_col_ranges)
+        for slot in range(width):
+            col = start_col + slot
+            left_side = thick if (slot == 0 and is_week_start) else (medium if slot == 0 else thin)
+            right_side = medium if slot == width - 1 else thin
+            for r in (ROW_SUBJECT, ROW_ZOOM, ROW_DATE):
+                cell = ws.cell(row=r, column=col)
+                cell.border = border(left=left_side, right=right_side, top=medium, bottom=medium)
+
+        for row_i, student in enumerate(students):
+            row = first_data_row + row_i
+            for slot in range(width):
+                col = start_col + slot
+                mark = None
+                if slot < len(lessons):
+                    entry = lessons[slot]
+                    day_marks = marks_by_date.get(d.isoformat(), {})
+                    mark = day_marks.get(entry["id"], {}).get(student["id"])
+                cell = ws.cell(row=row, column=col, value=mark or None)
+                cell.font = font_normal
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                left_side = thick if (slot == 0 and is_week_start) else (medium if slot == 0 else thin)
+                right_side = medium if slot == width - 1 else thin
+                cell.border = border(left=left_side, right=right_side, top=thin, bottom=thin)
+
+    # --- Ліва фіксована колонка з даними студентів ---
+    for row_i, student in enumerate(students):
+        row = first_data_row + row_i
+        num_cell = ws.cell(row=row, column=1, value=row_i + 1)
+        num_cell.font = font_normal
+        num_cell.alignment = Alignment(horizontal="center", vertical="center")
+        num_cell.border = border(left=thick, top=thin, bottom=thin)
+        name_cell = ws.cell(row=row, column=2, value=student["full_name"])
+        name_cell.font = font_normal
+        name_cell.alignment = left_align
+        name_cell.border = border(top=thin, bottom=thin)
+        room_cell = ws.cell(row=row, column=3)
+        room_cell.font = font_normal
+        room_cell.border = border(top=thin, bottom=thin)
+
+    # --- Підсумковий рядок ---
+    total_row = first_data_row + len(students)
+    ws.merge_cells(start_row=total_row, start_column=1, end_row=total_row, end_column=3)
+    total_label = ws.cell(row=total_row, column=1, value="Усього відсутніх (запізнилося)")
+    total_label.font = font_total_label
+    total_label.border = border(left=thick, top=thin, bottom=medium)
+    if students:
+        first_r, last_r = first_data_row, first_data_row + len(students) - 1
+        for d, lessons, start_col, width in day_plan:
+            for slot in range(len(lessons)):
+                col = start_col + slot
+                col_letter = get_column_letter(col)
+                cell = ws.cell(
+                    row=total_row, column=col,
+                    value=f'=COUNTIF({col_letter}{first_r}:{col_letter}{last_r},"<>")',
+                )
+                cell.font = font_header
+                cell.alignment = Alignment(horizontal="center", vertical="center")
+                cell.border = border(top=thin, bottom=medium)
+
+    # --- Легенда ---
+    legend_row = total_row + 2
+    for i, line in enumerate(ATT_LEGEND_LINES):
+        c = ws.cell(row=legend_row + i, column=1, value=line)
+        c.font = font_header if i == 0 else font_normal
+
+    # --- Ширини колонок / висоти рядків ---
+    ws.column_dimensions["A"].width = 6.55
+    ws.column_dimensions["B"].width = 48.55
+    ws.column_dimensions["C"].width = 11.21
+    for c in range(4, last_col + 1):
+        ws.column_dimensions[get_column_letter(c)].width = 8.66
+    ws.row_dimensions[ROW_SUBJECT].height = 164.25
+    ws.row_dimensions[ROW_ZOOM].height = 15.75
+    ws.row_dimensions[ROW_DATE].height = 16.5
+    ws.freeze_panes = ws.cell(row=first_data_row, column=4).coordinate
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    return buf.getvalue()
+
+
 @dp.callback_query(F.data == "att_menu")
 async def cb_att_menu(callback: CallbackQuery, state: FSMContext):
     if not has_permission(callback.from_user.id, "attendance"):
@@ -1987,6 +2254,67 @@ async def cb_attexport(callback: CallbackQuery):
     )
 
 
+@dp.callback_query(F.data == "att_semester_groups")
+async def cb_att_semester_groups(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    groups = db.groups_with_students()
+    if not groups:
+        await callback.answer("Спершу завантаж список студентів хоч однієї групи.", show_alert=True)
+        return
+    rows = [[InlineKeyboardButton(text=g, callback_data=f"attsem~{g}")] for g in groups]
+    rows.append([InlineKeyboardButton(text="🔙 Меню", callback_data="att_menu")])
+    await callback.message.edit_text(
+        "Обери групу для семестрового журналу.\n"
+        "Якщо для групи ще не задано межі семестру — спершу виконай, напр.:\n"
+        "<code>/semester ТДН-24 01.09.2026 20.12.2026</code>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("attsem~"))
+async def cb_attsem(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Ця функція лише для адмінів 🔒", show_alert=True)
+        return
+    group = callback.data.split("~", 1)[1]
+    students = db.students_for_group(group)
+    if not students:
+        await callback.answer("У групи ще немає списку студентів.", show_alert=True)
+        return
+    bounds = db.get_semester_bounds(group)
+    if not bounds:
+        await callback.answer(
+            "Спершу задай межі семестру: /semester ГРУПА дд.мм.рррр дд.мм.рррр",
+            show_alert=True,
+        )
+        return
+    start_d = date.fromisoformat(bounds["start"])
+    end_d = date.fromisoformat(bounds["end"])
+    weeks = semester_weeks(start_d, end_d)
+    if not weeks:
+        await callback.answer("Порожній діапазон семестру — перевір межі.", show_alert=True)
+        return
+    await callback.answer("Генерую файл, це може зайняти кілька секунд…")
+    marks_by_date = db.attendance_marks_for_range(group, bounds["start"], bounds["end"])
+    try:
+        file_bytes = build_attendance_excel_semester(group, weeks, students, marks_by_date)
+    except Exception:
+        log.exception("Не вдалось згенерувати семестровий excel журналу відвідувань")
+        await callback.message.answer("Не вдалось згенерувати файл. Спробуй ще раз.")
+        return
+    filename = f"Журнал_відвідувань_{group}_{start_d.strftime('%Y')}.xlsx"
+    await callback.message.answer_document(
+        BufferedInputFile(file_bytes, filename=filename),
+        caption=(
+            f"📚 Журнал відвідувань за семестр — {html.escape(group)}\n"
+            f"{start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')}"
+        ),
+    )
+
+
 @dp.message(Command("group"))
 async def cmd_group(message: Message):
     await message.answer("Обери свою групу:", reply_markup=group_choice_keyboard())
@@ -2028,6 +2356,7 @@ async def cmd_admin(message: Message):
         lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
     if "attendance" in rights:
         lines.append("• «📋 Відвідування» в головному меню — список студентів і журнал відвідувань")
+        lines.append("• <code>/semester ГРУПА дд.мм.рррр дд.мм.рррр</code> — задати межі семестру (для журналу за весь семестр)")
     if is_owner(message.from_user.id):
         lines.append("• <code>/staff</code> — права заступників")
     await message.answer("\n".join(lines))
