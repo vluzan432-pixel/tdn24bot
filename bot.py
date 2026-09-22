@@ -1490,6 +1490,8 @@ async def cmd_admin(message: Message):
     lines = ["🛠 <b>Адмін-команди</b>"]
     if "schedule" in rights:
         lines.append("• Редагування розкладу — через кнопку «✏️ Редагувати розклад».")
+        zoom_status = "увімк ✅" if db.zoom_in_reminders_enabled() else "вимк ⛔"
+        lines.append(f"• <code>/zoom_reminders on|off</code> — Zoom-кнопка в нагадуваннях перед парою (зараз: {zoom_status})")
     if "announce" in rights:
         lines.append("• <code>/announce текст</code> — звичайне оголошення")
         lines.append("• <code>/urgent текст</code> — термінове оголошення")
@@ -1502,6 +1504,31 @@ async def cmd_admin(message: Message):
     if is_owner(message.from_user.id):
         lines.append("• <code>/staff</code> — права заступників")
     await message.answer("\n".join(lines))
+
+
+@dp.message(Command("zoom_reminders"))
+async def cmd_zoom_reminders(message: Message):
+    if not has_permission(message.from_user.id, "schedule"):
+        await message.answer("Для цього потрібне право <code>schedule</code> 🔒")
+        return
+    arg = message.text.partition(" ")[2].strip().lower()
+    if arg in ("on", "увімк", "увімкнути", "1"):
+        db.set_zoom_in_reminders(True)
+        await message.answer("🎥 Посилання на Zoom у нагадуваннях перед парою: <b>увімкнено</b> ✅")
+        return
+    if arg in ("off", "вимк", "вимкнути", "0"):
+        db.set_zoom_in_reminders(False)
+        await message.answer(
+            "🎥 Посилання на Zoom у нагадуваннях перед парою: <b>вимкнено</b> ✅\n"
+            "(кнопка «🎥 Посилання в Zoom» під розкладом дня й далі працює як завжди — "
+            "це стосується лише автоматичних нагадувань)"
+        )
+        return
+    status = "увімкнено ✅" if db.zoom_in_reminders_enabled() else "вимкнено ⛔"
+    await message.answer(
+        f"🎥 Zoom у нагадуваннях зараз: <b>{status}</b>\n\n"
+        "Змінити: <code>/zoom_reminders on</code> або <code>/zoom_reminders off</code>"
+    )
 
 
 @dp.message(Command("staff"))
@@ -2416,12 +2443,16 @@ async def _check_reminders_impl():
                         f"(затримка пінгу):\n\n{format_entry(entry)}"
                     )
                 zoom_keyboard = None
-                found = find_zoom(entry.get("teacher"))
-                if found:
-                    _surname, info = found
-                    zoom_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text="🎥 Приєднатись до Zoom", url=info["link"])
-                    ]])
+                # Вимикається адміном командою /zoom_reminders off (напр. коли
+                # група перейшла на очне навчання) — тоді нагадування йде без
+                # кнопки Zoom, навіть якщо посилання для викладача є в базі.
+                if db.zoom_in_reminders_enabled():
+                    found = find_zoom(entry.get("teacher"))
+                    if found:
+                        _surname, info = found
+                        zoom_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                            InlineKeyboardButton(text="🎥 Приєднатись до Zoom", url=info["link"])
+                        ]])
                 try:
                     await bot.send_message(user["chat_id"], text, reply_markup=zoom_keyboard)
                     reminders_sent += 1
