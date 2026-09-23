@@ -693,28 +693,6 @@ def overrides_for(group_name: str, date_str: str):
     return [dict(zip(cols, r)) for r in rows]
 
 
-def overrides_for_group(group_name: str, kind: str | None = None):
-    """Усі правки групи одразу (без фільтра по одній даті) — для масового
-    перегляду чи чистки, напр. коли треба знайти й видалити кілька помилково
-    доданих вручну пар за різні дати одним проходом."""
-    conn = _connect()
-    if kind:
-        rows = conn.execute(
-            "SELECT id, date, kind, base_pair, base_time, pair, time, subject, teacher, room, note "
-            "FROM overrides WHERE group_name = ? AND kind = ? ORDER BY date",
-            (group_name, kind),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT id, date, kind, base_pair, base_time, pair, time, subject, teacher, room, note "
-            "FROM overrides WHERE group_name = ? ORDER BY date",
-            (group_name,),
-        ).fetchall()
-    conn.close()
-    cols = ["id", "date", "kind", "base_pair", "base_time", "pair", "time", "subject", "teacher", "room", "note"]
-    return [dict(zip(cols, r)) for r in rows]
-
-
 def delete_override(override_id: int):
     conn = _connect()
     conn.execute("DELETE FROM overrides WHERE id = ?", (override_id,))
