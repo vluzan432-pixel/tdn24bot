@@ -374,14 +374,48 @@ def _merge_parallel_lessons(group_items: list):
     if len(group_items) == 1:
         return group_items[0]
 
+    # Спецвипадок "Диригування" + "Спів": у цьому слоті пари вони йдуть як
+    # окрема підгрупова пара всередині ширшого списку паралельних вибіркових
+    # предметів (напр. разом з "Аналіз музичних творів", "Фортепіано" тощо —
+    # у різні тижні набір "сусідів" різний). У сирих даних сам текст цього
+    # дуету теж не стабільний ("Диригування" / "Диригування (вибіркова ОК)").
+    # Тому: якщо в слоті є РІВНО один предмет "Диригування..." і РІВНО один
+    # "Спів...", їх пара завжди зводиться до одного канонічного фрагмента —
+    # решта предметів слоту (якщо є) з'єднуються навколо нього як звично.
+    def _is_dyr(s: str) -> bool:
+        return s.strip().lower().startswith("диригування")
+
+    def _is_spv(s: str) -> bool:
+        return s.strip().lower().startswith("спів")
+
+    dyr_matches = [lesson for lesson, _ in group_items if _is_dyr(lesson.get("subject") or "")]
+    spv_matches = [lesson for lesson, _ in group_items if _is_spv(lesson.get("subject") or "")]
+    dyr = dyr_matches[0] if len(dyr_matches) == 1 else None
+    spv = spv_matches[0] if len(spv_matches) == 1 else None
+    use_canonical = dyr is not None and spv is not None
+
     subjects, teachers, rooms, notes = [], [], [], []
     combined_matches = []
+    canonical_inserted = False
     for lesson, matches in group_items:
+        combined_matches.extend(matches)
+        if use_canonical and (lesson is dyr or lesson is spv):
+            if not canonical_inserted:
+                t1 = (dyr.get("teacher") or "").strip()
+                t2 = (spv.get("teacher") or "").strip()
+                canon = f"Диригування / Спів (викладач: {t1} і {t2})" if t1 and t2 else "Диригування / Спів"
+                if canon not in subjects:
+                    subjects.append(canon)
+                canonical_inserted = True
+            for bucket, field in ((rooms, "room"), (notes, "note")):
+                value = (lesson.get(field) or "").strip()
+                if value and value not in bucket:
+                    bucket.append(value)
+            continue
         for bucket, field in ((subjects, "subject"), (teachers, "teacher"), (rooms, "room"), (notes, "note")):
             value = (lesson.get(field) or "").strip()
             if value and value not in bucket:
                 bucket.append(value)
-        combined_matches.extend(matches)
 
     merged = dict(group_items[0][0])
     merged["subject"] = " / ".join(subjects) if subjects else merged.get("subject")
@@ -1537,7 +1571,6 @@ DAY_SHORT = {
 # журналі — стільки, скільки в оригінальному ТДН-24.xls. Якщо в конкретний
 # день пар більше — блок дня просто розширюється під фактичну кількість, щоб
 # нічого не загубити (плата за це — трохи ширші колонки того дня).
-ATT_SEMESTER_DAY_SLOTS = 4
 
 ATT_MARK_CYCLE = ["", "н", "хв", "нб", "сп", "вп", "нп"]
 ATT_MARK_NAMES = {"н": "Н", "хв": "ХВ", "нб": "НБ", "сп": "СП", "вп": "ВП", "нп": "НП"}
@@ -1603,10 +1636,32 @@ async def cmd_semester(message: Message):
     )
 
 
+def _att_full_subject(entry: dict) -> str:
+    """Повна назва предмета для журналу — з поясненням у дужках (поле
+    note), якщо воно є: напр. subject='Хоровий клас' + note='(методика та
+    практика роботи з народним хором)' -> 'Хоровий клас (методика та
+    практика роботи з народним хором)'. У сирих даних розкладу таке
+    пояснення часто лежить окремо в note і губилось при показі лише
+    subject."""
+    subj = (entry.get("subject") or "").strip()
+    note = (entry.get("note") or "").strip()
+    if note and note not in subj:
+        return f"{subj} {note}".strip()
+    return subj
+
+
 def att_lessons_for_day(group: str, d: date) -> list:
-    """Пари групи на день (з урахуванням правок/скасувань), без скасованих —
-    відмічати відвідування на скасованій парі немає сенсу."""
-    return [e for e in group_entries_for_edit(group, d) if not e.get("cancelled")]
+    """Пари групи на день для ЖУРНАЛУ відвідування: базовий розклад,
+    включно з системними переносами/змінами (override kind="change" —
+    source лишається "base"), БЕЗ скасованих (кind="cancel") і БЕЗ вручну
+    доданих зверху пар (kind="add", source=="override_add"). Такі додані
+    вручну пари (напр. додатковий хор) лишаються видимими студентам у
+    звичайному розкладі бота (build_day_entries/group_entries_for_edit),
+    просто не потрапляють в офіційний журнал відвідування."""
+    return [
+        e for e in group_entries_for_edit(group, d)
+        if not e.get("cancelled") and e.get("source") != "override_add"
+    ]
 
 
 def _att_find_entry(group: str, d: date, entry_id: str):
@@ -1783,7 +1838,7 @@ def build_attendance_excel(group: str, d: date, lessons: list, students: list, m
 
     for i, entry in enumerate(lessons):
         col = 3 + i
-        subj = (entry.get("subject") or "").strip()
+        subj = _att_full_subject(entry)
         teacher = (entry.get("teacher") or "").strip()
         room = (entry.get("room") or "").strip()
         header_lines = [f"Пара {entry.get('pair', '')} · {entry.get('time', '')}", subj]
@@ -1869,16 +1924,17 @@ def semester_weeks(start_d: date, end_d: date) -> list:
 def build_attendance_excel_semester(group: str, weeks: list, students: list, marks_by_date: dict) -> bytes:
     """Журнал відвідувань за весь семестр в один аркуш (.xlsx, без ліміту
     256 колонок старого .xls) — макет 1:1 як у ТДН-24.xls: тижні як блоки
-    колонок, у блоці тижня — по 4 колонки (слоти пар) на кожен робочий день,
-    у шапці дня — назва предмета+викладач (текст повернутий на 90°) і
-    статичний підпис "Zoom", під ними — коротка назва дня і дата (мерж на
-    решту колонок дня). Позначки студентів пишуться прямо в комірку
-    відповідного предмета/дня; підсумковий рядок — формулою COUNTIF, як і
-    в поденному журналі.
+    колонок; у блоці тижня — по одній колонці РІВНО на кожну фактичну пару
+    того дня (2 пари — 2 колонки, 4 пари — 4, без порожніх "запасних"
+    колонок; дні зовсім без пар колонок не займають). У шапці дня — повна
+    назва предмета+викладач (текст повернутий на 90°) і аудиторія (замість
+    статичного "Zoom"), під ними — коротка назва дня і дата. Позначки
+    студентів пишуться прямо в комірку відповідного предмета/дня;
+    підсумковий рядок — формулою COUNTIF, як і в поденному журналі.
 
-    Ширина дня — ATT_SEMESTER_DAY_SLOTS (як в оригіналі), але якщо в
-    конкретний день пар фактично більше — блок цього дня розширюється, щоб
-    жодна пара не загубилась."""
+    Пари, додані вручну "зверху" (не з офіційного розкладу — override
+    kind="add"), у журнал НЕ потрапляють — лише базовий розклад і системні
+    переноси/зміни (kind="change"). Див. att_lessons_for_day()."""
     wb = Workbook()
     ws = wb.active
     ws.title = "Відвідування"
@@ -1904,20 +1960,31 @@ def build_attendance_excel_semester(group: str, weeks: list, students: list, mar
     ROW_WEEK, ROW_SUBJECT, ROW_ZOOM, ROW_DATE = 1, 2, 3, 4
     first_data_row = 5
 
-    # Спершу прораховуємо ширину блоку кожного дня (>= ATT_SEMESTER_DAY_SLOTS,
-    # більше — якщо реально пар більше) і призначаємо колонки наперед, щоб
-    # писати заголовки й дані за один прохід.
-    day_plan = []  # [(d, lessons, start_col, width), ...]
+    # Ширина блоку дня = РІВНО стільки пар, скільки їх того дня (2 пари —
+    # 2 колонки, 4 пари — 4 колонки, без порожніх "запасних" колонок). Дні
+    # без жодної пари (наприклад скасовані повністю) не займають колонок
+    # узагалі — інакше в таблиці лишались би порожні пропуски.
+    # week_headers — лише тижні, де реально є хоч одна пара (напр. канікули
+    # пропускаються повністю), тому номер тижня береться з ПОЗИЦІЇ в
+    # оригінальному списку weeks (week_idx), а не з порядку в цьому списку —
+    # це навмисно не той самий лічильник, щоб "Тиждень №N" завжди відповідав
+    # N-му календарному тижню семестру, навіть якщо котрийсь тиждень посередині
+    # пропущено.
+    day_plan = []  # [(d, lessons, start_col, width), ...] — лише дні з lessons
     col_cursor = 4  # A,B,C зайняті під №/ПІБ/Аудит.
-    week_col_ranges = []  # [(start_col, end_col), ...] по одному на тиждень
-    for week in weeks:
+    week_headers = []  # [(week_no, start_col, end_col), ...] — лише непорожні тижні
+    for week_idx, week in enumerate(weeks, start=1):
         week_start_col = col_cursor
         for d in week:
             lessons = att_lessons_for_day(group, d)
-            width = max(ATT_SEMESTER_DAY_SLOTS, len(lessons))
+            if not lessons:
+                continue
+            width = len(lessons)
             day_plan.append((d, lessons, col_cursor, width))
             col_cursor += width
-        week_col_ranges.append((week_start_col, col_cursor - 1))
+        if col_cursor > week_start_col:
+            week_headers.append((week_idx, week_start_col, col_cursor - 1))
+    week_col_ranges = [(wstart, wend) for _, wstart, wend in week_headers]
 
     last_col = max(3, col_cursor - 1)
 
@@ -1943,7 +2010,7 @@ def build_attendance_excel_semester(group: str, weeks: list, students: list, mar
     c4.alignment = center
 
     # --- Заголовки тижнів (рядок 1) ---
-    for week_no, (week, (wcol_start, wcol_end)) in enumerate(zip(weeks, week_col_ranges), start=1):
+    for week_no, wcol_start, wcol_end in week_headers:
         if wcol_end > wcol_start:
             ws.merge_cells(start_row=ROW_WEEK, start_column=wcol_start, end_row=ROW_WEEK, end_column=wcol_end)
         wc = ws.cell(row=ROW_WEEK, column=wcol_start, value=f"Тиждень №{week_no}")
@@ -1955,29 +2022,33 @@ def build_attendance_excel_semester(group: str, weeks: list, students: list, mar
         day_short = DAY_SHORT.get(DAY_NAMES[d.weekday()], "")
         for slot in range(width):
             col = start_col + slot
-            if slot < len(lessons):
-                entry = lessons[slot]
-                subj = (entry.get("subject") or "").strip()
-                teacher = (entry.get("teacher") or "").strip()
-                subj_cell_value = f"{subj}\n({teacher})" if teacher else subj
-            else:
-                subj_cell_value = ""
+            entry = lessons[slot]
+            subj = _att_full_subject(entry)
+            teacher = (entry.get("teacher") or "").strip()
+            subj_cell_value = f"{subj}\n({teacher})" if teacher else subj
             sc = ws.cell(row=ROW_SUBJECT, column=col, value=subj_cell_value or None)
             sc.font = font_header
             sc.alignment = rotated
-            zc = ws.cell(row=ROW_ZOOM, column=col, value="Zoom")
+            room_text = (entry.get("room") or "").strip()
+            zc = ws.cell(row=ROW_ZOOM, column=col, value=room_text or None)
             zc.font = font_header
             zc.alignment = Alignment(horizontal="general", vertical="bottom")
 
-        first = ws.cell(row=ROW_DATE, column=start_col, value=day_short)
-        first.font = font_header
-        first.alignment = Alignment(horizontal="general", vertical="bottom")
-        if width > 1:
+        if width == 1:
+            # лише 1 пара цього дня — немає окремої колонки під дату, тож
+            # день+дата пишуться разом в єдину наявну колонку.
+            only = ws.cell(row=ROW_DATE, column=start_col, value=f"{day_short} {d.strftime('%d.%m')}")
+            only.font = font_header
+            only.alignment = center_no_wrap
+        else:
+            first = ws.cell(row=ROW_DATE, column=start_col, value=day_short)
+            first.font = font_header
+            first.alignment = Alignment(horizontal="general", vertical="bottom")
             ws.merge_cells(start_row=ROW_DATE, start_column=start_col + 1, end_row=ROW_DATE, end_column=start_col + width - 1)
-        date_cell = ws.cell(row=ROW_DATE, column=start_col + 1, value=d)
-        date_cell.number_format = "DD.MM"
-        date_cell.font = font_header
-        date_cell.alignment = center_no_wrap
+            date_cell = ws.cell(row=ROW_DATE, column=start_col + 1, value=d)
+            date_cell.number_format = "DD.MM"
+            date_cell.font = font_header
+            date_cell.alignment = center_no_wrap
 
         # межі: медіум навколо блоку дня, товста зліва — якщо це початок тижня
         is_week_start = any(start_col == wstart for wstart, _ in week_col_ranges)
