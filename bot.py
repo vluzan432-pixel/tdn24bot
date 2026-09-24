@@ -789,17 +789,25 @@ def main_menu_text(group: str) -> str:
     )
 
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
+def is_any_admin(chat_id: int) -> bool:
+    """Чи має людина взагалі якісь адмін-права — головний адмін або хоч
+    одне право заступника. Визначає, чи показувати кнопку «Панель
+    керування» в головному меню."""
+    return is_owner(chat_id) or bool(db.staff_permissions(chat_id))
+
+
+def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
         [InlineKeyboardButton(text="🗓 Найближчі семінари / практичні / ПК", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
         [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
-        [InlineKeyboardButton(text="📋 Відвідування 🔒", callback_data="att_menu")],
-        [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
         [InlineKeyboardButton(text="✏️ Редагувати розклад", callback_data="edit_menu")],
+        [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
         [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
     ]
+    if is_any_admin(chat_id):
+        rows.append([InlineKeyboardButton(text="🛠 Панель керування", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -958,7 +966,7 @@ async def cmd_start(message: Message):
     group = await require_group(message)
     if not group:
         return
-    await message.answer(main_menu_text(group), reply_markup=main_menu_keyboard())
+    await message.answer(main_menu_text(group), reply_markup=main_menu_keyboard(message.from_user.id))
 
 
 @dp.callback_query(F.data == "main_menu")
@@ -967,7 +975,7 @@ async def cb_main_menu(callback: CallbackQuery):
     if not group:
         await callback.answer()
         return
-    await callback.message.edit_text(main_menu_text(group), reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(main_menu_text(group), reply_markup=main_menu_keyboard(callback.from_user.id))
     await callback.answer()
 
 
@@ -1543,7 +1551,7 @@ def att_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📥 Завантажити список студентів", callback_data="att_roster")],
         [InlineKeyboardButton(text="📝 Відмітити відсутніх", callback_data="att_mark_groups")],
         [InlineKeyboardButton(text="📚 Журнал за семестр (Excel)", callback_data="att_semester_groups")],
-        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
+        [InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2472,32 +2480,440 @@ def _owner_only(message: Message) -> bool:
     return is_owner(message.from_user.id)
 
 
+def admin_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if has_permission(chat_id, "schedule"):
+        rows.append([InlineKeyboardButton(text="✏️ Редагувати розклад групи", callback_data="edit_scope:group")])
+        zoom_on = db.zoom_in_reminders_enabled()
+        rows.append([InlineKeyboardButton(
+            text=f"🎥 Zoom у нагадуваннях: {'увімкнено ✅' if zoom_on else 'вимкнено ⛔'}",
+            callback_data="panel_zoom_toggle",
+        )])
+    if has_permission(chat_id, "announce"):
+        rows.append([InlineKeyboardButton(text="📣 Оголошення", callback_data="panel_announce")])
+    if has_permission(chat_id, "materials"):
+        rows.append([InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")])
+    if has_permission(chat_id, "polls"):
+        rows.append([InlineKeyboardButton(text="📊 Опитування", callback_data="panel_poll")])
+    if has_permission(chat_id, "attendance"):
+        rows.append([InlineKeyboardButton(text="📋 Відвідування", callback_data="att_menu")])
+        rows.append([InlineKeyboardButton(text="📅 Межі семестру", callback_data="panel_semester")])
+    if is_owner(chat_id):
+        rows.append([InlineKeyboardButton(text="👥 Заступники та права", callback_data="panel_staff")])
+        rows.append([InlineKeyboardButton(text="🛠 Оновлення бота (розсилка)", callback_data="panel_update")])
+        rows.append([InlineKeyboardButton(text="🕘 Історія оновлень", callback_data="panel_updates_history")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    rights = PERMISSIONS if is_owner(message.from_user.id) else db.staff_permissions(message.from_user.id)
-    if not rights:
+    if not is_any_admin(message.from_user.id):
         await message.answer("Адмін-функції тобі не доступні 🔒")
         return
-    lines = ["🛠 <b>Адмін-команди</b>"]
-    if "schedule" in rights:
-        lines.append("• Редагування розкладу — через кнопку «✏️ Редагувати розклад».")
-        zoom_status = "увімк ✅" if db.zoom_in_reminders_enabled() else "вимк ⛔"
-        lines.append(f"• <code>/zoom_reminders on|off</code> — Zoom-кнопка в нагадуваннях перед парою (зараз: {zoom_status})")
-    if "announce" in rights:
-        lines.append("• <code>/announce текст</code> — звичайне оголошення")
-        lines.append("• <code>/urgent текст</code> — термінове оголошення")
-    if "materials" in rights:
-        lines.append("• «📚 Матеріали» → «➕ Додати матеріал» — прикріпити файл (ноти, PDF, таблицю) або посилання")
-        lines.append("• <code>/material Предмет | Назва | https://посилання</code> — швидко додати лише лінк")
-        lines.append("• <code>/materials del назва</code> — видалити матеріал за назвою (запитає уточнення, якщо збігів кілька)")
-    if "polls" in rights:
-        lines.append("• <code>/poll Питання | Варіант 1 | Варіант 2</code>")
-    if "attendance" in rights:
-        lines.append("• «📋 Відвідування» в головному меню — список студентів і журнал відвідувань")
-        lines.append("• <code>/semester ГРУПА дд.мм.рррр дд.мм.рррр</code> — задати межі семестру (для журналу за весь семестр)")
-    if is_owner(message.from_user.id):
-        lines.append("• <code>/staff</code> — права заступників")
-    await message.answer("\n".join(lines))
+    await message.answer("🛠 <b>Панель керування</b>\n\nОбери дію:", reply_markup=admin_panel_keyboard(message.from_user.id))
+
+
+@dp.callback_query(F.data == "admin_panel")
+async def cb_admin_panel(callback: CallbackQuery, state: FSMContext):
+    if not is_any_admin(callback.from_user.id):
+        await callback.answer("Адмін-функції тобі не доступні 🔒", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text("🛠 <b>Панель керування</b>\n\nОбери дію:", reply_markup=admin_panel_keyboard(callback.from_user.id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "panel_zoom_toggle")
+async def cb_panel_zoom_toggle(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "schedule"):
+        await callback.answer("Потрібне право schedule 🔒", show_alert=True)
+        return
+    db.set_zoom_in_reminders(not db.zoom_in_reminders_enabled())
+    await callback.message.edit_reply_markup(reply_markup=admin_panel_keyboard(callback.from_user.id))
+    status = "увімкнено ✅" if db.zoom_in_reminders_enabled() else "вимкнено ⛔"
+    await callback.answer(f"Zoom у нагадуваннях: {status}")
+
+
+# --------------------------------------------------------------- оголошення
+
+class AnnounceState(StatesGroup):
+    waiting_text = State()
+
+
+@dp.callback_query(F.data == "panel_announce")
+async def cb_panel_announce(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "announce"):
+        await callback.answer("Потрібне право announce 🔒", show_alert=True)
+        return
+    await state.clear()
+    rows = [[InlineKeyboardButton(text=g, callback_data=f"anngrp:{g}")] for g in GROUPS]
+    rows.append([InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")])
+    await callback.message.edit_text("📣 Оголошення — для якої групи?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("anngrp:"))
+async def cb_anngrp(callback: CallbackQuery):
+    if not has_permission(callback.from_user.id, "announce"):
+        await callback.answer("Потрібне право announce 🔒", show_alert=True)
+        return
+    group = callback.data.split(":", 1)[1]
+    rows = [
+        [InlineKeyboardButton(text="📣 Звичайне", callback_data=f"annkind:normal:{group}")],
+        [InlineKeyboardButton(text="🚨 Термінове", callback_data=f"annkind:urgent:{group}")],
+        [InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")],
+    ]
+    await callback.message.edit_text(
+        f"Група {html.escape(group)}. Який тип оголошення?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("annkind:"))
+async def cb_annkind(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "announce"):
+        await callback.answer("Потрібне право announce 🔒", show_alert=True)
+        return
+    _, kind, group = callback.data.split(":", 2)
+    await state.set_state(AnnounceState.waiting_text)
+    await state.update_data(ann_kind=kind, ann_group=group)
+    label = "термінового" if kind == "urgent" else "звичайного"
+    await callback.message.edit_text(f"Напиши текст {label} оголошення для {html.escape(group)}:")
+    await callback.answer()
+
+
+@dp.message(StateFilter(AnnounceState.waiting_text))
+async def announce_text_received(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "announce"):
+        await state.clear()
+        return
+    data = await state.get_data()
+    kind, group = data.get("ann_kind"), data.get("ann_group")
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Текст порожній — напиши ще раз, або /start щоб скасувати.")
+        return
+    await state.clear()
+    if kind == "urgent":
+        await broadcast_group(group, f"🚨 <b>Терміново</b>\n\n{html.escape(text)}")
+        sent_label = "Термінове повідомлення"
+    else:
+        await broadcast_announcement(group, f"📣 <b>Оголошення</b>\n\n{html.escape(text)}")
+        sent_label = "Оголошення"
+    await message.answer(
+        f"{sent_label} надіслано для {html.escape(group)} ✅",
+        reply_markup=admin_panel_keyboard(message.from_user.id),
+    )
+
+
+# --------------------------------------------------------------- опитування
+
+class PollState(StatesGroup):
+    waiting_text = State()
+
+
+@dp.callback_query(F.data == "panel_poll")
+async def cb_panel_poll(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "polls"):
+        await callback.answer("Потрібне право polls 🔒", show_alert=True)
+        return
+    await state.clear()
+    rows = [[InlineKeyboardButton(text=g, callback_data=f"pollgrp:{g}")] for g in GROUPS]
+    rows.append([InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")])
+    await callback.message.edit_text("📊 Опитування — для якої групи?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("pollgrp:"))
+async def cb_pollgrp(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "polls"):
+        await callback.answer("Потрібне право polls 🔒", show_alert=True)
+        return
+    group = callback.data.split(":", 1)[1]
+    await state.set_state(PollState.waiting_text)
+    await state.update_data(poll_group=group)
+    await callback.message.edit_text(
+        f"Група {html.escape(group)}. Надішли одним повідомленням:\n"
+        "<code>Питання | Варіант 1 | Варіант 2 | ...</code>\nВід 2 до 10 варіантів."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(PollState.waiting_text))
+async def poll_text_received(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "polls"):
+        await state.clear()
+        return
+    data = await state.get_data()
+    group = data.get("poll_group")
+    parts = [p.strip() for p in (message.text or "").split("|") if p.strip()]
+    if not 3 <= len(parts) <= 11:
+        await message.answer(
+            "Формат: <code>Питання | Варіант 1 | Варіант 2 | ...</code>\nВід 2 до 10 варіантів. Спробуй ще раз."
+        )
+        return
+    await state.clear()
+    question, options = parts[0], parts[1:]
+    sent = 0
+    for chat_id in db.announcement_users_in_group(group):
+        try:
+            await bot.send_poll(chat_id, question, options, is_anonymous=False)
+            sent += 1
+        except Exception:
+            log.exception("Не вдалось надіслати опитування %s", chat_id)
+    await message.answer(
+        f"Опитування надіслано: {sent} отримувачам ✅", reply_markup=admin_panel_keyboard(message.from_user.id)
+    )
+
+
+# ---------------------------------------------------------------- семестр
+
+class SemesterState(StatesGroup):
+    waiting_start = State()
+    waiting_end = State()
+
+
+@dp.callback_query(F.data == "panel_semester")
+async def cb_panel_semester(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Потрібне право attendance 🔒", show_alert=True)
+        return
+    await state.clear()
+    lines = ["📅 <b>Межі семестру</b>", "\nОбери групу, щоб задати чи змінити межі:"]
+    bounds_lines = []
+    for group in GROUPS:
+        b = db.get_semester_bounds(group)
+        if b:
+            start_d = date.fromisoformat(b["start"])
+            end_d = date.fromisoformat(b["end"])
+            bounds_lines.append(f"• {group}: {start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')}")
+    if bounds_lines:
+        lines.append("\nЗараз задано:")
+        lines.extend(bounds_lines)
+    rows = [[InlineKeyboardButton(text=g, callback_data=f"semgrp:{g}")] for g in GROUPS]
+    rows.append([InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")])
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("semgrp:"))
+async def cb_semgrp(callback: CallbackQuery, state: FSMContext):
+    if not has_permission(callback.from_user.id, "attendance"):
+        await callback.answer("Потрібне право attendance 🔒", show_alert=True)
+        return
+    group = callback.data.split(":", 1)[1]
+    await state.set_state(SemesterState.waiting_start)
+    await state.update_data(sem_group=group)
+    await callback.message.edit_text(
+        f"Група {html.escape(group)}. Напиши <b>перший день</b> семестру у форматі дд.мм.рррр "
+        "(напр. 01.09.2026):"
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(SemesterState.waiting_start))
+async def semester_start_received(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "attendance"):
+        await state.clear()
+        return
+    try:
+        start_d = datetime.strptime((message.text or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Дата має бути у форматі дд.мм.рррр, напр. 01.09.2026. Спробуй ще раз.")
+        return
+    await state.update_data(sem_start=start_d.isoformat())
+    await state.set_state(SemesterState.waiting_end)
+    await message.answer("Тепер напиши <b>останній день</b> семестру (дд.мм.рррр):")
+
+
+@dp.message(StateFilter(SemesterState.waiting_end))
+async def semester_end_received(message: Message, state: FSMContext):
+    if not has_permission(message.from_user.id, "attendance"):
+        await state.clear()
+        return
+    try:
+        end_d = datetime.strptime((message.text or "").strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Дата має бути у форматі дд.мм.рррр, напр. 20.12.2026. Спробуй ще раз.")
+        return
+    data = await state.get_data()
+    group = data.get("sem_group")
+    start_d = date.fromisoformat(data.get("sem_start"))
+    if end_d <= start_d:
+        await message.answer("Останній день має бути пізніше першого. Спробуй ще раз.")
+        return
+    await state.clear()
+    db.set_semester_bounds(group, start_d.isoformat(), end_d.isoformat())
+    await message.answer(
+        f"Межі семестру для {html.escape(group)} збережено: "
+        f"{start_d.strftime('%d.%m.%Y')} — {end_d.strftime('%d.%m.%Y')} ✅",
+        reply_markup=admin_panel_keyboard(message.from_user.id),
+    )
+
+
+# ------------------------------------------------------ заступники / права
+
+class StaffState(StatesGroup):
+    waiting_new_id = State()
+
+
+def staff_permissions_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+    current = db.staff_permissions(chat_id)
+    rows = []
+    for perm in sorted(PERMISSIONS):
+        mark = "✅" if perm in current else "⬜"
+        rows.append([InlineKeyboardButton(text=f"{mark} {PERMISSION_LABELS[perm]}", callback_data=f"staffperm:{chat_id}:{perm}")])
+    rows.append([InlineKeyboardButton(text="🗑 Забрати всі права", callback_data=f"staffrevoke:{chat_id}")])
+    rows.append([InlineKeyboardButton(text="🔙 Заступники", callback_data="panel_staff")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "panel_staff")
+async def cb_panel_staff(callback: CallbackQuery, state: FSMContext):
+    if not _owner_only(callback):
+        await callback.answer("Керувати правами може тільки головний адміністратор 🔒", show_alert=True)
+        return
+    await state.clear()
+    staff = db.all_staff()
+    rows = []
+    for s in staff:
+        rights = ", ".join(PERMISSION_LABELS[p] for p in sorted(s["permissions"]) if p in PERMISSION_LABELS) or "без прав"
+        rows.append([InlineKeyboardButton(text=f"{s['chat_id']} — {rights}", callback_data=f"staffedit:{s['chat_id']}")])
+    rows.append([InlineKeyboardButton(text="➕ Додати заступника", callback_data="staffadd")])
+    rows.append([InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")])
+    text = "👥 <b>Заступники</b>\n\nГоловний адміністратор — ти (права з Render)."
+    if not staff:
+        text += "\n\nПоки нікого не додано."
+    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "staffadd")
+async def cb_staffadd(callback: CallbackQuery, state: FSMContext):
+    if not _owner_only(callback):
+        await callback.answer("Керувати правами може тільки головний адміністратор 🔒", show_alert=True)
+        return
+    await state.set_state(StaffState.waiting_new_id)
+    await callback.message.edit_text(
+        "Надішли Telegram chat_id нового заступника (число — людина може дізнатись його, "
+        "наприклад, через @userinfobot)."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(StaffState.waiting_new_id))
+async def staff_new_id_received(message: Message, state: FSMContext):
+    if not _owner_only(message):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text.lstrip("-").isdigit():
+        await message.answer("Це має бути число (chat_id). Спробуй ще раз, або /start щоб скасувати.")
+        return
+    await state.clear()
+    chat_id = int(text)
+    await message.answer(
+        f"Обери права для <code>{chat_id}</code> (тап перемикає):", reply_markup=staff_permissions_keyboard(chat_id)
+    )
+
+
+@dp.callback_query(F.data.startswith("staffedit:"))
+async def cb_staffedit(callback: CallbackQuery):
+    if not _owner_only(callback):
+        await callback.answer("Керувати правами може тільки головний адміністратор 🔒", show_alert=True)
+        return
+    chat_id = int(callback.data.split(":", 1)[1])
+    await callback.message.edit_text(
+        f"Права для <code>{chat_id}</code> (тап перемикає):", reply_markup=staff_permissions_keyboard(chat_id)
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("staffperm:"))
+async def cb_staffperm(callback: CallbackQuery):
+    if not _owner_only(callback):
+        await callback.answer("Керувати правами може тільки головний адміністратор 🔒", show_alert=True)
+        return
+    _, chat_id_s, perm = callback.data.split(":", 2)
+    chat_id = int(chat_id_s)
+    current = set(db.staff_permissions(chat_id))
+    if perm in current:
+        current.discard(perm)
+    else:
+        current.add(perm)
+    if current:
+        db.set_staff_permissions(chat_id, current, callback.from_user.id)
+    else:
+        db.remove_staff(chat_id)
+    await callback.message.edit_reply_markup(reply_markup=staff_permissions_keyboard(chat_id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("staffrevoke:"))
+async def cb_staffrevoke(callback: CallbackQuery):
+    if not _owner_only(callback):
+        await callback.answer("Керувати правами може тільки головний адміністратор 🔒", show_alert=True)
+        return
+    chat_id = int(callback.data.split(":", 1)[1])
+    db.remove_staff(chat_id)
+    await callback.answer("Права забрано ✅")
+    await callback.message.edit_reply_markup(reply_markup=staff_permissions_keyboard(chat_id))
+
+
+# ------------------------------------------------------- оновлення бота
+
+class UpdateState(StatesGroup):
+    waiting_text = State()
+
+
+@dp.callback_query(F.data == "panel_update")
+async def cb_panel_update(callback: CallbackQuery, state: FSMContext):
+    if not _owner_only(callback):
+        await callback.answer("Лише головний адміністратор 🔒", show_alert=True)
+        return
+    await state.set_state(UpdateState.waiting_text)
+    await callback.message.edit_text(
+        "Напиши текст оновлення — розішлю всім зареєстрованим користувачам бота й запишу в історію."
+    )
+    await callback.answer()
+
+
+@dp.message(StateFilter(UpdateState.waiting_text))
+async def update_text_received(message: Message, state: FSMContext):
+    if not _owner_only(message):
+        await state.clear()
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.answer("Текст порожній — напиши ще раз, або /start щоб скасувати.")
+        return
+    await state.clear()
+    db.add_changelog_entry(text, message.from_user.id)
+    chat_ids = db.all_registered_chat_ids()
+    await _broadcast_to(chat_ids, f"🛠 <b>Оновлення бота:</b>\n{html.escape(text)}")
+    await message.answer(
+        f"Записано й розіслано {len(chat_ids)} користувачам ✅", reply_markup=admin_panel_keyboard(message.from_user.id)
+    )
+
+
+@dp.callback_query(F.data == "panel_updates_history")
+async def cb_panel_updates_history(callback: CallbackQuery):
+    if not _owner_only(callback):
+        await callback.answer("Лише головний адміністратор 🔒", show_alert=True)
+        return
+    entries = db.recent_changelog(10)
+    rows = [[InlineKeyboardButton(text="🔙 Панель керування", callback_data="admin_panel")]]
+    if not entries:
+        await callback.message.edit_text("Оновлень поки не записано.", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await callback.answer()
+        return
+    lines = ["🕘 <b>Історія оновлень бота:</b>\n"]
+    for e in entries:
+        d = date.fromisoformat(e["created_at"])
+        lines.append(f"<b>{d.strftime('%d.%m.%Y')}</b>: {html.escape(e['text'])}")
+    await callback.message.edit_text("\n\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
 
 
 @dp.message(Command("zoom_reminders"))
@@ -2832,7 +3248,7 @@ async def cmd_delnote(message: Message):
 async def cb_setgroup(callback: CallbackQuery):
     group = callback.data.split(":", 1)[1]
     db.set_group(callback.from_user.id, group)
-    await callback.message.edit_text(f"Група {html.escape(group)} збережена ✅\n\n" + main_menu_text(group), reply_markup=main_menu_keyboard())
+    await callback.message.edit_text(f"Група {html.escape(group)} збережена ✅\n\n" + main_menu_text(group), reply_markup=main_menu_keyboard(callback.from_user.id))
     await callback.answer()
 
 
