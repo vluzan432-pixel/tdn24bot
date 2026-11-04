@@ -64,6 +64,9 @@ from schedule_data import (
     lesson_key,
     lesson_start_time,
     lessons_for_date,
+    session_events_for_date,
+    session_events_for_group,
+    session_kind_emoji,
     subject_has_lectures,
     type_label,
 )
@@ -361,6 +364,35 @@ def type_line_for(matches: list):
     return " / ".join(parts)
 
 
+def session_entries(group: str, d: date) -> list:
+    """Заліки / іспити / консультації групи на дату у тому ж уніфікованому
+    форматі, що й пари (source="session"). Не потрапляють ні в адмінське
+    редагування розкладу, ні в журнал відвідувань — див. group_entries_for_edit."""
+    result = []
+    for ev in session_events_for_date(group, d):
+        teachers = ev.get("teachers") or []
+        result.append(
+            {
+                "id": f"s:{ev['date']}:{ev.get('time')}:{ev.get('subject')}",
+                "pair": ev.get("kind") or "Сесія",
+                "time": ev.get("time"),
+                "subject": ev.get("subject"),
+                "note": ev.get("note"),
+                "teacher": "; ".join(teachers) if teachers else None,
+                "room": ev.get("room"),
+                "type_line": None,
+                "cancelled": False,
+                "changed": False,
+                "source": "session",
+                "kind": ev.get("kind"),
+                "teachers": teachers,
+                "commission": len(teachers) > 1,
+                "note_key": f"ses:{group}:{ev['date']}:{ev.get('time')}:{ev.get('subject')}",
+            }
+        )
+    return result
+
+
 def build_day_entries(chat_id: int, group: str, d: date):
     """Повертає єдиний список 'пар' на день для конкретного chat_id: базовий
     розклад групи з накладеними адмінськими правками (overrides) + особисті
@@ -469,6 +501,8 @@ def build_day_entries(chat_id: int, group: str, d: date):
             }
         )
 
+    entries.extend(session_entries(group, d))
+
     for il in db.individual_lessons_for(chat_id, day_name, date_str):
         entries.append(
             {
@@ -493,9 +527,10 @@ def build_day_entries(chat_id: int, group: str, d: date):
 
 
 def group_entries_for_edit(group: str, d: date):
-    """Те саме, але без індивідуальних занять — для адмінського редагування
-    загального розкладу (chat_id=0, бо індивідуальні тут не потрібні)."""
-    return [e for e in build_day_entries(0, group, d) if e["source"] != "individual"]
+    """Те саме, але без індивідуальних занять і подій сесії — для адмінського
+    редагування загального розкладу та журналу відвідувань (chat_id=0, бо
+    індивідуальні тут не потрібні; заліки/іспити/консультації в журнал не йдуть)."""
+    return [e for e in build_day_entries(0, group, d) if e["source"] not in ("individual", "session")]
 
 
 def _entry_or_none(chat_id: int, group: str, d: date, idx: int):
@@ -506,7 +541,12 @@ def _entry_or_none(chat_id: int, group: str, d: date, idx: int):
 
 
 def format_entry(entry: dict) -> str:
-    label = "Індивідуальне" if entry["source"] == "individual" else f"Пара {html.escape(str(entry.get('pair') or ''))}"
+    if entry["source"] == "individual":
+        label = "Індивідуальне"
+    elif entry["source"] == "session":
+        label = html.escape(entry.get("kind") or "Сесія")
+    else:
+        label = f"Пара {html.escape(str(entry.get('pair') or ''))}"
     header = f"🕐 <b>{label}</b> · {html.escape(entry.get('time') or '')}"
 
     if entry.get("cancelled"):
@@ -521,6 +561,8 @@ def format_entry(entry: dict) -> str:
         prefix = "✏️ "
     elif entry["source"] == "individual":
         prefix = "🎓 "
+    elif entry["source"] == "session":
+        prefix = f"{session_kind_emoji(entry.get('kind'))} "
     elif entry["source"] == "override_add":
         prefix = "➕ "
     else:
@@ -529,7 +571,10 @@ def format_entry(entry: dict) -> str:
 
     if entry.get("type_line"):
         lines.append(entry["type_line"])
-    if entry.get("teacher"):
+    if entry.get("commission"):
+        lines.append("👥 <b>Комісія:</b>")
+        lines.extend(f"  • {html.escape(t)}" for t in entry.get("teachers") or [])
+    elif entry.get("teacher"):
         lines.append(f"👤 {html.escape(entry['teacher'])}")
     if entry.get("room"):
         lines.append(f"📍 {html.escape(entry['room'])}")
@@ -780,6 +825,7 @@ def main_menu_text(group: str) -> str:
         f"🎓 <b>{html.escape(group)}</b>\n"
         "Обери розділ:\n\n"
         "📅 <b>Розклад пар</b> — заняття на день, гортання по датах або одразу через 📆 календар\n"
+        "🧾 <b>Розклад сесії</b> — заліки, іспити та консультації\n"
         "🗓 <b>Найближчі семінари / практичні / ПК</b> — важливе на кілька тижнів наперед, без рутинних практичних\n"
         "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад, вручну або імпортом з Excel\n"
         "📚 <b>Матеріали</b> — посилання від старости та викладачів\n"
@@ -799,6 +845,7 @@ def is_any_admin(chat_id: int) -> bool:
 def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
+        [InlineKeyboardButton(text="🧾 Розклад сесії", callback_data="session_menu")],
         [InlineKeyboardButton(text="🗓 Найближчі семінари / практичні / ПК", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
         [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
@@ -918,6 +965,7 @@ def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     offsets = set(db.get_reminder_offsets(chat_id))
     tomorrow_on = user["tomorrow_on"] if user else False
     announcements_on = user["announcements_on"] if user else True
+    session_on = user["session_on"] if user else False
 
     rows = []
     preset_row = []
@@ -944,6 +992,10 @@ def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     rows.append([InlineKeyboardButton(
         text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
         callback_data="toggle_announcements",
+    )])
+    rows.append([InlineKeyboardButton(
+        text=("🧾 Нагадування про сесію: увімкнено" if session_on else "🧾 Нагадування про сесію: вимкнено"),
+        callback_data="toggle_session",
     )])
     rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -979,6 +1031,103 @@ async def cb_main_menu(callback: CallbackQuery):
     await callback.answer()
 
 
+# ------------------------------------------------------------------ сесія
+
+SESSION_PAGE_CHARS = 3300
+SHORT_DAYS = ["пн", "вт", "ср", "чт", "пт", "сб", "нд"]
+
+
+def session_pages(group: str) -> list:
+    """Розклад сесії групи, розбитий на сторінки під ліміт Telegram (4096
+    символів). Кожна сторінка: {"text": ..., "dates": [iso, ...]}."""
+    dates = sorted({e["date"] for e in session_events_for_group(group)})
+    divider = "\n➖➖➖➖➖➖➖➖\n"
+    pages, blocks, block_dates, size = [], [], [], 0
+    for iso in dates:
+        d = date.fromisoformat(iso)
+        entries = session_entries(group, d)
+        block = f"📅 <b>{DAY_NAMES[d.weekday()]}, {d.strftime('%d.%m.%Y')}</b>\n\n" + "\n\n".join(
+            format_entry(e) for e in entries
+        )
+        if blocks and size + len(block) > SESSION_PAGE_CHARS:
+            pages.append({"blocks": blocks, "dates": block_dates})
+            blocks, block_dates, size = [], [], 0
+        blocks.append(block)
+        block_dates.append(iso)
+        size += len(block) + len(divider)
+    if blocks:
+        pages.append({"blocks": blocks, "dates": block_dates})
+
+    total = len(pages)
+    for i, page in enumerate(pages, start=1):
+        page["text"] = (
+            f"🧾 <b>Розклад сесії</b> · {html.escape(group)}"
+            + (f" · {i}/{total}" if total > 1 else "")
+            + "\n\n"
+            + divider.join(page["blocks"])
+        )
+    return pages
+
+
+def session_keyboard(pages: list, page_idx: int) -> InlineKeyboardMarkup:
+    rows = []
+    if len(pages) > 1:
+        nav = []
+        if page_idx > 0:
+            nav.append(InlineKeyboardButton(text="◀", callback_data=f"ses_page:{page_idx - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page_idx + 1}/{len(pages)}", callback_data="noop"))
+        if page_idx < len(pages) - 1:
+            nav.append(InlineKeyboardButton(text="▶", callback_data=f"ses_page:{page_idx + 1}"))
+        rows.append(nav)
+    day_row = []
+    for iso in pages[page_idx]["dates"]:
+        d = date.fromisoformat(iso)
+        day_row.append(InlineKeyboardButton(
+            text=f"📅 {SHORT_DAYS[d.weekday()]} {d.strftime('%d.%m')}", callback_data=f"day:{iso}"
+        ))
+        if len(day_row) == 3:
+            rows.append(day_row)
+            day_row = []
+    if day_row:
+        rows.append(day_row)
+    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _show_session_page(callback: CallbackQuery, page_idx: int | None):
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    pages = session_pages(group)
+    if not pages:
+        await callback.message.edit_text(
+            f"🧾 Для групи {html.escape(group)} розклад сесії поки не додано.",
+            reply_markup=back_to_menu_keyboard(),
+        )
+        await callback.answer()
+        return
+    if page_idx is None:
+        today_iso = today_kyiv().isoformat()
+        page_idx = next(
+            (i for i, p in enumerate(pages) if any(iso >= today_iso for iso in p["dates"])),
+            len(pages) - 1,
+        )
+    page_idx = max(0, min(page_idx, len(pages) - 1))
+    await callback.message.edit_text(pages[page_idx]["text"], reply_markup=session_keyboard(pages, page_idx))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "session_menu")
+async def cb_session_menu(callback: CallbackQuery):
+    await _show_session_page(callback, None)
+
+
+@dp.callback_query(F.data.startswith("ses_page:"))
+async def cb_session_page(callback: CallbackQuery):
+    await _show_session_page(callback, int(callback.data.split(":", 1)[1]))
+
+
 @dp.callback_query(F.data == "settings_menu")
 async def cb_settings_menu(callback: CallbackQuery):
     user = db.get_user(callback.from_user.id)
@@ -988,7 +1137,9 @@ async def cb_settings_menu(callback: CallbackQuery):
     await callback.message.edit_text(
         "⚙️ <b>Налаштування</b>\n\n"
         "Нагадування — можна обрати кілька рубежів одразу (напр. 15, 10 і 5 хв), "
-        "додати свій варіант хвилин, або вимкнути зовсім:",
+        "додати свій варіант хвилин, або вимкнути зовсім.\n\n"
+        "🧾 <b>Нагадування про сесію</b> — окремо від пар: напередодні о 19:00 і зранку о 8:00 в день "
+        "заліку / іспиту / консультації (а за хвилини до початку — за твоїми рубежами вище):",
         reply_markup=reminders_keyboard(callback.from_user.id),
     )
     await callback.answer()
@@ -3403,6 +3554,17 @@ async def cb_toggle_tomorrow(callback: CallbackQuery):
     await callback.answer("Розклад на завтра увімкнено ✅" if enabled else "Розсилку на завтра вимкнено")
 
 
+@dp.callback_query(F.data == "toggle_session")
+async def cb_toggle_session(callback: CallbackQuery):
+    user = db.get_user(callback.from_user.id)
+    enabled = not (user and user["session_on"])
+    db.toggle_session(callback.from_user.id, enabled)
+    await callback.message.edit_reply_markup(reply_markup=reminders_keyboard(callback.from_user.id))
+    await callback.answer(
+        "Нагадування про сесію увімкнено ✅" if enabled else "Нагадування про сесію вимкнено"
+    )
+
+
 @dp.callback_query(F.data == "toggle_announcements")
 async def cb_toggle_announcements(callback: CallbackQuery):
     user = db.get_user(callback.from_user.id)
@@ -3755,6 +3917,8 @@ async def note_text_received(message: Message, state: FSMContext):
 # не надсилається взагалі. GRACE_MINUTES дозволяє долавити пари, момент
 # нагадування яких вже трохи минув, поки бот не встиг перевірити.
 GRACE_MINUTES = 10
+SESSION_EVE_HOUR = 19      # нагадування напередодні заліку/іспиту/консультації — з 19:00
+SESSION_MORNING_HOUR = 8   # і зранку в день події — з 8:00
 
 # Стан останнього запуску check_reminders() — читається через GET /cron-status,
 # щоб можна було в браузері перевірити, чи зовнішній пінгер (cron-job.org,
@@ -3783,6 +3947,57 @@ async def check_reminders():
         return
     async with _check_reminders_lock:
         await _check_reminders_impl()
+
+
+async def _send_session_reminders(user: dict, now: datetime) -> int:
+    chat_id, group = user["chat_id"], user["group"]
+    today = now.date()
+    divider = "\n➖➖➖➖➖➖➖➖\n"
+    sent = 0
+
+    # Напередодні. Умова "з 19:00" (а не "рівно о 19:00"), щоб запізнілий
+    # пінг нічого не пропустив; ключ у sent_reminders — щоб надіслати рівно раз.
+    if now.hour >= SESSION_EVE_HOUR:
+        tomorrow = today + timedelta(days=1)
+        events = session_entries(group, tomorrow)
+        if events and not db.was_reminder_sent(chat_id, "session_eve", today.isoformat()):
+            text = (
+                f"🧾 <b>Нагадування про сесію</b>\n"
+                f"Завтра, {DAY_NAMES[tomorrow.weekday()]} {tomorrow.strftime('%d.%m')}:\n\n"
+                + divider.join(format_entry(e) for e in events)
+            )
+            await bot.send_message(chat_id, text)
+            db.mark_reminder_sent(chat_id, "session_eve", today.isoformat())
+            sent += 1
+
+    # Зранку в день — лише ті події, що ще не почались.
+    if now.hour >= SESSION_MORNING_HOUR:
+        upcoming = []
+        for e in session_entries(group, today):
+            start = lesson_start_time(e)
+            if start is None or datetime.combine(today, start, tzinfo=KYIV_TZ) > now:
+                upcoming.append(e)
+        if upcoming and not db.was_reminder_sent(chat_id, "session_morning", today.isoformat()):
+            text = (
+                f"☀️ <b>Сьогодні сесія</b> — {DAY_NAMES[today.weekday()]} {today.strftime('%d.%m')}:\n\n"
+                + divider.join(format_entry(e) for e in upcoming)
+                + "\n\nУдачі! 🍀"
+            )
+            zoom_rows = []
+            if db.zoom_in_reminders_enabled():
+                for e in upcoming:
+                    found = find_zoom(e.get("teacher"))
+                    if found:
+                        subject = e.get("subject") or "Zoom"
+                        label = subject if len(subject) <= 28 else subject[:25] + "..."
+                        zoom_rows.append([InlineKeyboardButton(text=f"🎥 {label}", url=found[1]["link"])])
+            await bot.send_message(
+                chat_id, text,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=zoom_rows) if zoom_rows else None,
+            )
+            db.mark_reminder_sent(chat_id, "session_morning", today.isoformat())
+            sent += 1
+    return sent
 
 
 async def _check_reminders_impl():
@@ -3877,6 +4092,16 @@ async def _check_reminders_impl():
                 user.get("chat_id"),
                 user.get("group"),
             )
+            errors += 1
+
+    # Особливі нагадування про сесію (опційно, тумблер у налаштуваннях):
+    # напередодні та зранку в день. За хвилини до початку подія нагадується
+    # звичайним циклом вище — за рубежами, які людина сама обрала.
+    for user in db.session_users():
+        try:
+            reminders_sent += await _send_session_reminders(user, now)
+        except Exception:
+            log.exception("Не вдалось надіслати нагадування про сесію %s", user.get("chat_id"))
             errors += 1
 
     # Вечірній розклад. Зовнішній cron викликає цей код щохвилини; ключ у
