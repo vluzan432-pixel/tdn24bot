@@ -190,6 +190,7 @@ def init_db():
     for column in (
         "tomorrow_on INTEGER NOT NULL DEFAULT 0",
         "announcements_on INTEGER NOT NULL DEFAULT 1",
+        "session_on INTEGER NOT NULL DEFAULT 0",
     ):
         try:
             conn.execute(f"ALTER TABLE users ADD COLUMN {column}")
@@ -277,7 +278,7 @@ def set_group(chat_id: int, group_name: str):
 def get_user(chat_id: int):
     conn = _connect()
     row = conn.execute(
-        "SELECT chat_id, group_name, reminder_minutes, reminders_on, tomorrow_on, announcements_on "
+        "SELECT chat_id, group_name, reminder_minutes, reminders_on, tomorrow_on, announcements_on, session_on "
         "FROM users WHERE chat_id = ?",
         (chat_id,),
     ).fetchone()
@@ -286,7 +287,7 @@ def get_user(chat_id: int):
         return None
     return {
         "chat_id": row[0], "group": row[1], "reminder_minutes": row[2], "reminders_on": bool(row[3]),
-        "tomorrow_on": bool(row[4]), "announcements_on": bool(row[5]),
+        "tomorrow_on": bool(row[4]), "announcements_on": bool(row[5]), "session_on": bool(row[6]),
     }
 
 
@@ -341,6 +342,21 @@ def toggle_tomorrow(chat_id: int, on: bool):
     conn.execute("UPDATE users SET tomorrow_on = ? WHERE chat_id = ?", (1 if on else 0, chat_id))
     conn.commit()
     conn.close()
+
+
+def toggle_session(chat_id: int, on: bool):
+    conn = _connect()
+    conn.execute("UPDATE users SET session_on = ? WHERE chat_id = ?", (1 if on else 0, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def session_users():
+    """Хто ввімкнув «особливі нагадування про сесію»."""
+    conn = _connect()
+    rows = conn.execute("SELECT chat_id, group_name FROM users WHERE session_on = 1").fetchall()
+    conn.close()
+    return [{"chat_id": r[0], "group": r[1]} for r in rows]
 
 
 def toggle_announcements(chat_id: int, on: bool):
