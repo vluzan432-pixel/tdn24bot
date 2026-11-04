@@ -37,6 +37,7 @@ _TYPE_PREFIXES = [
 
 SCHEDULE_PATH = os.environ.get("SCHEDULE_PATH", "schedules.json")
 ZOOM_PATH = os.environ.get("ZOOM_PATH", "zoom_links.json")
+SESSION_PATH = os.environ.get("SESSION_PATH", "session.json")
 
 with open(SCHEDULE_PATH, encoding="utf-8") as f:
     SCHEDULES = json.load(f)  # {"ТДН-24": {"days": {...}}, "ТДН-25": {...}}
@@ -46,6 +47,12 @@ try:
         ZOOM_LINKS = json.load(f)
 except FileNotFoundError:
     ZOOM_LINKS = {}
+
+try:
+    with open(SESSION_PATH, encoding="utf-8") as f:
+        SESSIONS = json.load(f)  # {"ТДН-24": [{"date": "2026-11-06", "time": "14:10", "kind": "Залік", ...}]}
+except FileNotFoundError:
+    SESSIONS = {}
 
 GROUPS = sorted(SCHEDULES.keys())
 
@@ -117,12 +124,43 @@ def group_subjects(group: str) -> list:
 
 
 def find_zoom(teacher):
+    """Zoom за прізвищем викладача. Якщо в рядку викладачів збігаються
+    кілька різних прізвищ зі списку (напр. комісія на іспиті) — однозначно
+    обрати нікого, тому повертаємо None, а не перше-ліпше посилання."""
     if not teacher:
         return None
-    for surname, info in ZOOM_LINKS.items():
-        if re.search(rf"\b{re.escape(surname)}\b", teacher):
-            return surname, info
+    matches = [
+        (surname, info)
+        for surname, info in ZOOM_LINKS.items()
+        if re.search(rf"\b{re.escape(surname)}\b", teacher)
+    ]
+    if len(matches) == 1:
+        return matches[0]
     return None
+
+
+# ------------------------------------------------------------------ сесія
+
+SESSION_KINDS = {
+    "залік": "📝",
+    "іспит": "📕",
+    "консультація": "💬",
+}
+
+
+def session_kind_emoji(kind: str) -> str:
+    return SESSION_KINDS.get((kind or "").strip().lower(), "🧾")
+
+
+def session_events_for_group(group: str) -> list:
+    """Усі події сесії групи (заліки, іспити, консультації), за датою й часом."""
+    events = SESSIONS.get(group) or []
+    return sorted(events, key=lambda e: (e["date"], e.get("time") or ""))
+
+
+def session_events_for_date(group: str, d: date) -> list:
+    iso = d.isoformat()
+    return [e for e in session_events_for_group(group) if e["date"] == iso]
 
 
 def lesson_key(group: str, day_name: str, lesson: dict) -> str:
