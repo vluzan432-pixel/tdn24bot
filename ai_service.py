@@ -61,7 +61,9 @@ async def generate(
     body = {
         "systemInstruction": {"parts": [{"text": system}]},
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens},
+        # запас на «роздуми» моделі: вони рахуються в maxOutputTokens і без запасу
+        # відповідь виходить порожньою (finishReason = MAX_TOKENS)
+        "generationConfig": {"temperature": temperature, "maxOutputTokens": max_tokens + 2048},
     }
     if json_mode:
         body["generationConfig"]["responseMimeType"] = "application/json"
@@ -88,6 +90,7 @@ async def generate(
                             if text:
                                 return text
                             last_error = "порожня відповідь (можливо, спрацював фільтр безпеки)"
+                            log.error("Gemini порожня відповідь, модель %s: %s", model, str(data)[:600])
                             break  # повтор тут не допоможе
                         last_error = f"HTTP {resp.status}"
                         log.warning("Gemini %s (модель %s): %s", resp.status, model, str(data)[:300])
@@ -112,7 +115,7 @@ async def generate(
 def _extract_text(data: dict) -> str:
     try:
         parts = data["candidates"][0]["content"]["parts"]
-        return "".join(p.get("text", "") for p in parts).strip()
+        return "".join(p.get("text", "") for p in parts if not p.get("thought")).strip()
     except (KeyError, IndexError, TypeError):
         return ""
 
@@ -140,5 +143,5 @@ async def to_genitive_fio(full_name: str) -> str:
         "Поверни ЛИШЕ це ж ПІБ у родовому відмінку (хто? кого?), без пояснень, "
         "лапок і крапки. Зберігай порядок слів: прізвище, ім'я, по батькові."
     )
-    text = await generate(system, full_name, temperature=0.0, max_tokens=100)
+    text = await generate(system, full_name, temperature=0.0, max_tokens=300)
     return text.strip().strip("\"'«».")
