@@ -5,7 +5,7 @@ ai_service.py — тонкий async-клієнт до Google Gemini API (без
 
 Змінні середовища (Render → Environment):
     GEMINI_API_KEY   — ключ з https://aistudio.google.com (Get API key)
-    GEMINI_MODEL     — модель для коротких записів (за замовч. "gemini-2.5-flash")
+    GEMINI_MODEL     — модель для коротких записів (за замовч. "gemini-4-hydrogen")
     GEMINI_MODEL_LONG— модель для звіту/тез (за замовч. = GEMINI_MODEL)
 
 Безкоштовний ліміт ОДИН на весь ключ (тобто на всю групу разом), тому:
@@ -26,7 +26,7 @@ import aiohttp
 log = logging.getLogger("schedule-bot.ai")
 
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-MODEL_FAST = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL_FAST = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 MODEL_LONG = os.environ.get("GEMINI_MODEL_LONG", MODEL_FAST)
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
@@ -50,10 +50,11 @@ async def generate(
     json_mode: bool = False,
     temperature: float = 0.7,
     max_tokens: int = 4096,
-    retries: int = 3,
+    retries: int = 5,
 ) -> str:
     """Повертає текст відповіді моделі або кидає AIUnavailable."""
     if not GEMINI_API_KEY:
+        log.error("GEMINI_API_KEY не задано у змінних середовища (Render → Environment)")
         raise AIUnavailable("GEMINI_API_KEY не задано")
 
     model = MODEL_LONG if long else MODEL_FAST
@@ -67,7 +68,10 @@ async def generate(
     # "Роздуми" моделі їдять ліміт вихідних токенів і ціну ліміту — для наших
     # задач вони не потрібні. Якщо модель такого параметра не підтримує (HTTP 400),
     # нижче один раз повторюємо запит без нього.
-    body["generationConfig"]["thinkingConfig"] = {"thinkingBudget": 0}
+    # Різні покоління моделей керують «роздумами» по-різному: пробуємо рівень "low",
+    # потім бюджет 0, потім без параметра — перехід на наступний варіант при HTTP 400.
+    thinking_options = [{"thinkingLevel": "low"}, {"thinkingBudget": 0}, None]
+    body["generationConfig"]["thinkingConfig"] = thinking_options.pop(0)
 
     headers = {"x-goog-api-key": GEMINI_API_KEY, "Content-Type": "application/json"}
     timeout = aiohttp.ClientTimeout(total=120)
@@ -86,8 +90,13 @@ async def generate(
                             last_error = "порожня відповідь (можливо, спрацював фільтр безпеки)"
                             break  # повтор тут не допоможе
                         last_error = f"HTTP {resp.status}"
+                        log.warning("Gemini %s (модель %s): %s", resp.status, model, str(data)[:300])
                         if resp.status == 400 and "thinkingConfig" in body["generationConfig"]:
-                            del body["generationConfig"]["thinkingConfig"]
+                            nxt = thinking_options.pop(0) if thinking_options else None
+                            if nxt:
+                                body["generationConfig"]["thinkingConfig"] = nxt
+                            else:
+                                del body["generationConfig"]["thinkingConfig"]
                             continue
                         if resp.status not in (429, 500, 502, 503, 504):
                             log.error("Gemini помилка %s: %s", resp.status, str(data)[:300])
@@ -96,6 +105,7 @@ async def generate(
                 last_error = f"мережа: {e.__class__.__name__}"
             await asyncio.sleep(4 * (attempt + 1))
 
+    log.error("Gemini недоступний: %s", last_error)
     raise AIUnavailable(last_error)
 
 
