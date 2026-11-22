@@ -54,6 +54,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
 import db
+import practice
 from schedule_data import (
     DAY_NAMES,
     GROUPS,
@@ -85,10 +86,10 @@ PORT = int(os.environ.get("PORT", 10000))
 # групи. Свій id можна дізнатись командою /whoami після першого /start.
 ADMIN_IDS = {int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip().lstrip("-").isdigit()}
 
-PERMISSIONS = {"schedule", "announce", "materials", "polls", "attendance"}
+PERMISSIONS = {"schedule", "announce", "materials", "polls", "attendance", "practice"}
 PERMISSION_LABELS = {
     "schedule": "розклад", "announce": "оголошення", "materials": "матеріали", "polls": "опитування",
-    "attendance": "відвідування",
+    "attendance": "відвідування", "practice": "практика",
 }
 
 
@@ -822,16 +823,23 @@ def group_choice_keyboard() -> InlineKeyboardMarkup:
 
 def main_menu_text(group: str) -> str:
     return (
-        f"🎓 <b>{html.escape(group)}</b>\n"
-        "Обери розділ:\n\n"
+        f"🏠 <b>Головне меню</b> · {html.escape(group)}\n\n"
+        "🎓 <b>Навчання</b> — розклад пар і сесії, найближчі заняття, матеріали, редагування розкладу\n"
+        "🎼 <b>Практика</b> — щоденник і звіт практики з ШІ, новини, нагадування\n"
+        "👤 <b>Мій профіль</b> — ПІБ, спеціалізація, база практики, зміна групи\n"
+        "⚙️ <b>Налаштування</b> — нагадування, розклад на завтра, сесія, оголошення, практика"
+    )
+
+
+def study_menu_text(group: str) -> str:
+    return (
+        f"🎓 <b>Навчання</b> · {html.escape(group)}\n\n"
         "📅 <b>Розклад пар</b> — заняття на день, гортання по датах або одразу через 📆 календар\n"
         "🧾 <b>Розклад сесії</b> — заліки, іспити та консультації\n"
         "🗓 <b>Найближчі семінари / практичні / ПК</b> — важливе на кілька тижнів наперед, без рутинних практичних\n"
         "🎓 <b>Індивідуальні заняття</b> — твій особистий розклад, вручну або імпортом з Excel\n"
         "📚 <b>Матеріали</b> — посилання від старости та викладачів\n"
-        "⚙️ <b>Налаштування</b> — нагадування перед парою, розклад на завтра, оголошення\n"
-        "✏️ <b>Редагувати розклад</b> — виправити пару, якщо її перенесли\n"
-        "👥 <b>Вибір групи</b> — змінити групу"
+        "✏️ <b>Редагувати розклад</b> — виправити пару, якщо її перенесли"
     )
 
 
@@ -844,17 +852,26 @@ def is_any_admin(chat_id: int) -> bool:
 
 def main_menu_keyboard(chat_id: int) -> InlineKeyboardMarkup:
     rows = [
+        [InlineKeyboardButton(text="🎓 Навчання", callback_data="study_menu"),
+         InlineKeyboardButton(text="🎼 Практика", callback_data="practice_menu")],
+        [InlineKeyboardButton(text="👤 Мій профіль", callback_data="profile_menu"),
+         InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
+    ]
+    if is_any_admin(chat_id):
+        rows.append([InlineKeyboardButton(text="🛠 Панель керування", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def study_menu_keyboard() -> InlineKeyboardMarkup:
+    rows = [
         [InlineKeyboardButton(text="📅 Розклад пар", callback_data="today")],
         [InlineKeyboardButton(text="🧾 Розклад сесії", callback_data="session_menu")],
         [InlineKeyboardButton(text="🗓 Найближчі семінари / практичні / ПК", callback_data="upcoming")],
         [InlineKeyboardButton(text="🎓 Індивідуальні заняття", callback_data="individual_menu")],
         [InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")],
         [InlineKeyboardButton(text="✏️ Редагувати розклад", callback_data="edit_menu")],
-        [InlineKeyboardButton(text="⚙️ Налаштування", callback_data="settings_menu")],
-        [InlineKeyboardButton(text="👥 Вибір групи", callback_data="choose_group")],
+        [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
     ]
-    if is_any_admin(chat_id):
-        rows.append([InlineKeyboardButton(text="🛠 Панель керування", callback_data="admin_panel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -959,45 +976,56 @@ def edit_lesson_action_keyboard(d: date, idx: int, entry: dict) -> InlineKeyboar
 REMINDER_PRESETS = [5, 10, 15, 20, 30, 45, 60]
 
 
-def reminders_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+# Яку підсторінку налаштувань зараз відкрито в кожного користувача. Кнопки-перемикачі
+# (togglemin, toggle_session, ...) перемальовують клавіатуру через reminders_keyboard(chat_id),
+# тож вона бере розділ звідси. Після рестарту сервера просто повертається "pairs".
+_SETTINGS_SECTION: dict = {}
+
+SETTINGS_BACK = [InlineKeyboardButton(text="🔙 Налаштування", callback_data="settings_menu")]
+
+
+def reminders_keyboard(chat_id: int, section: str | None = None) -> InlineKeyboardMarkup:
+    section = section or _SETTINGS_SECTION.get(chat_id, "pairs")
     user = db.get_user(chat_id)
-    on = user["reminders_on"] if user else True
-    offsets = set(db.get_reminder_offsets(chat_id))
-    tomorrow_on = user["tomorrow_on"] if user else False
-    announcements_on = user["announcements_on"] if user else True
-    session_on = user["session_on"] if user else False
-
     rows = []
-    preset_row = []
-    for m in REMINDER_PRESETS:
-        text = f"✅ {m} хв" if m in offsets else f"{m} хв"
-        preset_row.append(InlineKeyboardButton(text=text, callback_data=f"togglemin:{m}"))
-        if len(preset_row) == 4:
+
+    if section == "pairs":
+        on = user["reminders_on"] if user else True
+        offsets = set(db.get_reminder_offsets(chat_id))
+        tomorrow_on = user["tomorrow_on"] if user else False
+        preset_row = []
+        for m in REMINDER_PRESETS:
+            text = f"✅ {m} хв" if m in offsets else f"{m} хв"
+            preset_row.append(InlineKeyboardButton(text=text, callback_data=f"togglemin:{m}"))
+            if len(preset_row) == 4:
+                rows.append(preset_row)
+                preset_row = []
+        if preset_row:
             rows.append(preset_row)
-            preset_row = []
-    if preset_row:
-        rows.append(preset_row)
+        custom_offsets = sorted((o for o in offsets if o not in REMINDER_PRESETS), reverse=True)
+        if custom_offsets:
+            rows.append([InlineKeyboardButton(text=f"✅ {m} хв ✕", callback_data=f"togglemin:{m}") for m in custom_offsets])
+        rows.append([InlineKeyboardButton(text="✏️ Свій варіант (хв)", callback_data="custom_min")])
+        rows.append([InlineKeyboardButton(text=("🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування"),
+                                           callback_data="toggle_reminders")])
+        rows.append([InlineKeyboardButton(
+            text=("✅ Розклад на завтра" if tomorrow_on else "📅 Розклад на завтра: вимкнено"),
+            callback_data="toggle_tomorrow",
+        )])
+    elif section == "session":
+        session_on = user["session_on"] if user else False
+        rows.append([InlineKeyboardButton(
+            text=("🧾 Нагадування про сесію: увімкнено" if session_on else "🧾 Нагадування про сесію: вимкнено"),
+            callback_data="toggle_session",
+        )])
+    elif section == "news":
+        announcements_on = user["announcements_on"] if user else True
+        rows.append([InlineKeyboardButton(
+            text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
+            callback_data="toggle_announcements",
+        )])
 
-    custom_offsets = sorted((o for o in offsets if o not in REMINDER_PRESETS), reverse=True)
-    if custom_offsets:
-        rows.append([InlineKeyboardButton(text=f"✅ {m} хв ✕", callback_data=f"togglemin:{m}") for m in custom_offsets])
-
-    rows.append([InlineKeyboardButton(text="✏️ Свій варіант (хв)", callback_data="custom_min")])
-    rows.append([InlineKeyboardButton(text=("🔕 Вимкнути нагадування" if on else "🔔 Увімкнути нагадування"),
-                                       callback_data="toggle_reminders")])
-    rows.append([InlineKeyboardButton(
-        text=("✅ Розклад на завтра" if tomorrow_on else "📅 Розклад на завтра: вимкнено"),
-        callback_data="toggle_tomorrow",
-    )])
-    rows.append([InlineKeyboardButton(
-        text=("📣 Оголошення: увімкнено" if announcements_on else "🔕 Оголошення: вимкнено"),
-        callback_data="toggle_announcements",
-    )])
-    rows.append([InlineKeyboardButton(
-        text=("🧾 Нагадування про сесію: увімкнено" if session_on else "🧾 Нагадування про сесію: вимкнено"),
-        callback_data="toggle_session",
-    )])
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    rows.append(SETTINGS_BACK)
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1014,7 +1042,8 @@ async def require_group(message_or_cb) -> str | None:
 # ------------------------------------------------------------------ хендлери
 
 @dp.message(CommandStart())
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.clear()
     group = await require_group(message)
     if not group:
         return
@@ -1022,12 +1051,24 @@ async def cmd_start(message: Message):
 
 
 @dp.callback_query(F.data == "main_menu")
-async def cb_main_menu(callback: CallbackQuery):
+async def cb_main_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
     group = await require_group(callback)
     if not group:
         await callback.answer()
         return
     await callback.message.edit_text(main_menu_text(group), reply_markup=main_menu_keyboard(callback.from_user.id))
+    await callback.answer()
+
+
+@dp.callback_query(F.data == "study_menu")
+async def cb_study_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    group = await require_group(callback)
+    if not group:
+        await callback.answer()
+        return
+    await callback.message.edit_text(study_menu_text(group), reply_markup=study_menu_keyboard())
     await callback.answer()
 
 
@@ -1128,19 +1169,49 @@ async def cb_session_page(callback: CallbackQuery):
     await _show_session_page(callback, int(callback.data.split(":", 1)[1]))
 
 
+SETTINGS_SECTION_TEXT = {
+    "pairs": (
+        "🔔 <b>Нагадування про пари</b>\n\n"
+        "Можна обрати кілька рубежів одразу (напр. 15, 10 і 5 хв), додати свій варіант хвилин "
+        "або вимкнути зовсім. Також тут — вечірній розклад на завтра."
+    ),
+    "session": (
+        "🧾 <b>Сесія</b>\n\n"
+        "Нагадування про сесію — окремо від пар: напередодні о 19:00 і зранку о 8:00 в день "
+        "заліку / іспиту / консультації (а за хвилини до початку — за рубежами з розділу «Пари»)."
+    ),
+    "news": "📣 <b>Оголошення</b>\n\nЗвичайні оголошення від старости й викладачів (термінові приходять завжди).",
+}
+
+
 @dp.callback_query(F.data == "settings_menu")
-async def cb_settings_menu(callback: CallbackQuery):
-    user = db.get_user(callback.from_user.id)
-    if not user:
+async def cb_settings_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if not db.get_user(callback.from_user.id):
         await callback.answer("Спершу обери групу", show_alert=True)
         return
     await callback.message.edit_text(
-        "⚙️ <b>Налаштування</b>\n\n"
-        "Нагадування — можна обрати кілька рубежів одразу (напр. 15, 10 і 5 хв), "
-        "додати свій варіант хвилин, або вимкнути зовсім.\n\n"
-        "🧾 <b>Нагадування про сесію</b> — окремо від пар: напередодні о 19:00 і зранку о 8:00 в день "
-        "заліку / іспиту / консультації (а за хвилини до початку — за твоїми рубежами вище):",
-        reply_markup=reminders_keyboard(callback.from_user.id),
+        "⚙️ <b>Налаштування</b>\n\nОбери розділ:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔔 Пари та розклад на завтра", callback_data="settings_sec:pairs")],
+            [InlineKeyboardButton(text="🧾 Сесія", callback_data="settings_sec:session")],
+            [InlineKeyboardButton(text="📣 Оголошення", callback_data="settings_sec:news")],
+            [InlineKeyboardButton(text="🎼 Практика (нагадування щоденника)", callback_data="pr_rem")],
+            [InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")],
+        ]),
+    )
+    await callback.answer()
+
+
+@dp.callback_query(F.data.startswith("settings_sec:"))
+async def cb_settings_section(callback: CallbackQuery):
+    section = callback.data.split(":", 1)[1]
+    if section not in SETTINGS_SECTION_TEXT or not db.get_user(callback.from_user.id):
+        await callback.answer()
+        return
+    _SETTINGS_SECTION[callback.from_user.id] = section
+    await callback.message.edit_text(
+        SETTINGS_SECTION_TEXT[section], reply_markup=reminders_keyboard(callback.from_user.id, section)
     )
     await callback.answer()
 
@@ -2631,29 +2702,60 @@ def _owner_only(message: Message) -> bool:
     return is_owner(message.from_user.id)
 
 
-def admin_panel_keyboard(chat_id: int) -> InlineKeyboardMarkup:
+ADMIN_BLOCK_TITLES = {
+    "study": "📚 <b>Навчання</b> — розклад, Zoom, матеріали, відвідування",
+    "comm": "📣 <b>Комунікація</b> — оголошення та опитування",
+    "practice": "🎼 <b>Практика</b> — оголошення, студенти, налаштування практики",
+    "system": "👑 <b>Система</b> — заступники та оновлення бота",
+}
+
+
+def admin_panel_keyboard(chat_id: int, block: str | None = None) -> InlineKeyboardMarkup:
+    def B(text, data):
+        return InlineKeyboardButton(text=text, callback_data=data)
+
     rows = []
-    if has_permission(chat_id, "schedule"):
-        rows.append([InlineKeyboardButton(text="✏️ Редагувати розклад групи", callback_data="edit_scope:group")])
-        zoom_on = db.zoom_in_reminders_enabled()
-        rows.append([InlineKeyboardButton(
-            text=f"🎥 Zoom у нагадуваннях: {'увімкнено ✅' if zoom_on else 'вимкнено ⛔'}",
-            callback_data="panel_zoom_toggle",
-        )])
-    if has_permission(chat_id, "announce"):
-        rows.append([InlineKeyboardButton(text="📣 Оголошення", callback_data="panel_announce")])
-    if has_permission(chat_id, "materials"):
-        rows.append([InlineKeyboardButton(text="📚 Матеріали", callback_data="materials_menu")])
-    if has_permission(chat_id, "polls"):
-        rows.append([InlineKeyboardButton(text="📊 Опитування", callback_data="panel_poll")])
-    if has_permission(chat_id, "attendance"):
-        rows.append([InlineKeyboardButton(text="📋 Відвідування", callback_data="att_menu")])
-        rows.append([InlineKeyboardButton(text="📅 Межі семестру", callback_data="panel_semester")])
-    if is_owner(chat_id):
-        rows.append([InlineKeyboardButton(text="👥 Заступники та права", callback_data="panel_staff")])
-        rows.append([InlineKeyboardButton(text="🛠 Оновлення бота (розсилка)", callback_data="panel_update")])
-        rows.append([InlineKeyboardButton(text="🕘 Історія оновлень", callback_data="panel_updates_history")])
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    if block is None:  # головна сторінка — лише блоки, доступні цій людині
+        if any(has_permission(chat_id, p) for p in ("schedule", "materials", "attendance")):
+            rows.append([B("📚 Навчання", "admin_blk:study")])
+        if any(has_permission(chat_id, p) for p in ("announce", "polls")):
+            rows.append([B("📣 Комунікація", "admin_blk:comm")])
+        if has_permission(chat_id, "practice"):
+            rows.append([B("🎼 Практика", "admin_blk:practice")])
+        if is_owner(chat_id):
+            rows.append([B("👑 Система", "admin_blk:system")])
+        rows.append([B("🏠 Меню", "main_menu")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if block == "study":
+        if has_permission(chat_id, "schedule"):
+            rows.append([B("✏️ Редагувати розклад групи", "edit_scope:group")])
+            zoom_on = db.zoom_in_reminders_enabled()
+            rows.append([B(f"🎥 Zoom у нагадуваннях: {'увімкнено ✅' if zoom_on else 'вимкнено ⛔'}", "panel_zoom_toggle")])
+        if has_permission(chat_id, "materials"):
+            rows.append([B("📚 Матеріали", "materials_menu")])
+        if has_permission(chat_id, "attendance"):
+            rows.append([B("📋 Відвідування", "att_menu")])
+            rows.append([B("📅 Межі семестру", "panel_semester")])
+    elif block == "comm":
+        if has_permission(chat_id, "announce"):
+            rows.append([B("📣 Оголошення", "panel_announce")])
+        if has_permission(chat_id, "polls"):
+            rows.append([B("📊 Опитування", "panel_poll")])
+    elif block == "practice":
+        if has_permission(chat_id, "practice"):
+            rows.append([B("📢 Опублікувати оголошення практики", "pra_announce")])
+            rows.append([B("🗂 Керувати оголошеннями", "pra_manage")])
+            rows.append([B("👥 Список студентів", "pra_students")])
+            rows.append([B("⚙️ Налаштування практики", "pra_settings")])
+            rows.append([B("📣 Попросити оновити профіль", "pra_ping")])
+    elif block == "system":
+        if is_owner(chat_id):
+            rows.append([B("👥 Заступники та права", "panel_staff")])
+            rows.append([B("🛠 Оновлення бота (розсилка)", "panel_update")])
+            rows.append([B("🕘 Історія оновлень", "panel_updates_history")])
+    rows.append([B("🔙 Панель керування", "admin_panel")])
+    rows.append([B("🏠 Меню", "main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -2675,13 +2777,29 @@ async def cb_admin_panel(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+@dp.callback_query(F.data.startswith("admin_blk:"))
+async def cb_admin_block(callback: CallbackQuery, state: FSMContext):
+    if not is_any_admin(callback.from_user.id):
+        await callback.answer("Адмін-функції тобі не доступні 🔒", show_alert=True)
+        return
+    await state.clear()
+    block = callback.data.split(":", 1)[1]
+    if block not in ADMIN_BLOCK_TITLES:
+        await callback.answer()
+        return
+    await callback.message.edit_text(
+        ADMIN_BLOCK_TITLES[block], reply_markup=admin_panel_keyboard(callback.from_user.id, block)
+    )
+    await callback.answer()
+
+
 @dp.callback_query(F.data == "panel_zoom_toggle")
 async def cb_panel_zoom_toggle(callback: CallbackQuery):
     if not has_permission(callback.from_user.id, "schedule"):
         await callback.answer("Потрібне право schedule 🔒", show_alert=True)
         return
     db.set_zoom_in_reminders(not db.zoom_in_reminders_enabled())
-    await callback.message.edit_reply_markup(reply_markup=admin_panel_keyboard(callback.from_user.id))
+    await callback.message.edit_reply_markup(reply_markup=admin_panel_keyboard(callback.from_user.id, "study"))
     status = "увімкнено ✅" if db.zoom_in_reminders_enabled() else "вимкнено ⛔"
     await callback.answer(f"Zoom у нагадуваннях: {status}")
 
@@ -4121,6 +4239,12 @@ async def _check_reminders_impl():
                 log.exception("Не вдалось надіслати розклад на завтра %s", user["chat_id"])
                 errors += 1
 
+    try:
+        reminders_sent += await practice.check_practice_reminders(bot, now)
+    except Exception:
+        log.exception("Помилка нагадувань практики")
+        errors += 1
+
     _last_cron_run["at"] = now.isoformat()
     _last_cron_run["users_checked"] = users_checked
     _last_cron_run["reminders_sent"] = reminders_sent
@@ -4177,6 +4301,8 @@ def main():
         raise SystemExit("Постав змінну середовища BOT_TOKEN (токен від @BotFather)")
 
     db.init_db()
+    practice.configure(has_permission=has_permission)
+    dp.include_router(practice.router)
 
     app = web.Application()
     app.on_startup.append(on_startup)

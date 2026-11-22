@@ -148,6 +148,55 @@ CREATE TABLE IF NOT EXISTS semester_bounds (
     start_date TEXT NOT NULL,
     end_date TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS profiles (
+    chat_id INTEGER PRIMARY KEY,
+    full_name TEXT,
+    full_name_gen TEXT,
+    course TEXT,
+    practice_kind TEXT,
+    specialization TEXT,
+    practice_base TEXT,
+    collective TEXT,
+    base_supervisor TEXT,
+    updated_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS practice_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    entry_date TEXT NOT NULL,
+    tasks TEXT NOT NULL,
+    annotation TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS practice_photos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id INTEGER NOT NULL,
+    file_id TEXT NOT NULL,
+    caption TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS practice_news (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name TEXT NOT NULL,
+    title TEXT NOT NULL,
+    body TEXT NOT NULL,
+    file_id TEXT,
+    file_type TEXT,
+    created_by INTEGER NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS practice_reminders (
+    chat_id INTEGER PRIMARY KEY,
+    diary_on INTEGER NOT NULL DEFAULT 0,
+    diary_time TEXT NOT NULL DEFAULT '20:00',
+    sat_on INTEGER NOT NULL DEFAULT 0,
+    sat_time TEXT NOT NULL DEFAULT '14:00'
+);
 """
 
 
@@ -957,3 +1006,311 @@ def get_semester_bounds(group_name: str):
     if not row:
         return None
     return {"start": row[0], "end": row[1]}
+
+
+# ================================================================== ПРАКТИКА
+#
+# Фото-додатки зберігаємо як Telegram file_id (а не файли на диску): диск на
+# безкоштовному Render тимчасовий, а file_id живе в Turso разом з усім іншим.
+
+from datetime import datetime as _dt
+
+PRACTICE_CFG_LABELS = {
+    "course": "Курс (римськими, напр. ІІІ)",
+    "practice_kind": "Вид практики (навчальна / виробнича)",
+    "dept_supervisor": "Керівник від кафедри",
+    "terms": "Терміни практики (напр. 17.11.2026 – 29.11.2026)",
+    "year": "Рік (для «Київ – ...»)",
+    "university": "Заклад",
+    "department": "Кафедра",
+    "specialty": "Спеціальність",
+    "program": "Назва ОПП",
+}
+
+
+def _practice_defaults() -> dict:
+    return {
+        "university": "Київський національний університет культури і мистецтв",
+        "department": "Кафедра музичного мистецтва",
+        "specialty": "025 «Музичне мистецтво»",
+        "program": "«Диригентсько-хорове мистецтво (народне)»",
+        "course": "ІІІ",
+        "practice_kind": "навчальна",
+        "dept_supervisor": "",
+        "terms": "",
+        "year": str(_today_kyiv().year),
+    }
+
+
+def get_practice_cfg(group: str) -> dict:
+    cfg = _practice_defaults()
+    for field in cfg:
+        value = get_setting(f"practice:{group}:{field}")
+        if value is not None and value != "":
+            cfg[field] = value
+    return cfg
+
+
+def set_practice_cfg(group: str, field: str, value: str):
+    if field not in PRACTICE_CFG_LABELS:
+        raise ValueError(field)
+    set_setting(f"practice:{group}:{field}", value)
+
+
+# --- профіль
+
+_PROFILE_FIELDS = (
+    "full_name", "full_name_gen", "course", "practice_kind",
+    "specialization", "practice_base", "collective", "base_supervisor",
+)
+
+
+def get_profile(chat_id: int):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT " + ", ".join(_PROFILE_FIELDS) + " FROM profiles WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return None
+    return dict(zip(_PROFILE_FIELDS, row))
+
+
+def save_profile(chat_id: int, **fields):
+    """Upsert: оновлює лише передані поля."""
+    fields = {k: v for k, v in fields.items() if k in _PROFILE_FIELDS}
+    if not fields:
+        return
+    conn = _connect()
+    conn.execute("INSERT OR IGNORE INTO profiles (chat_id) VALUES (?)", (chat_id,))
+    sets = ", ".join(f"{k} = ?" for k in fields) + ", updated_at = ?"
+    conn.execute(
+        f"UPDATE profiles SET {sets} WHERE chat_id = ?",
+        (*fields.values(), _dt.now(KYIV_TZ).isoformat(timespec="seconds"), chat_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def profile_is_complete(chat_id: int) -> bool:
+    p = get_profile(chat_id)
+    return bool(p and p.get("full_name") and p.get("full_name_gen"))
+
+
+# --- записи щоденника
+
+def add_practice_entry(chat_id: int, entry_date: str, tasks: str, annotation: str) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO practice_entries (chat_id, entry_date, tasks, annotation, created_at) VALUES (?, ?, ?, ?, ?)",
+        (chat_id, entry_date, tasks, annotation, _dt.now(KYIV_TZ).isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    entry_id = cur.lastrowid
+    conn.close()
+    return entry_id
+
+
+def _entry_row(r) -> dict:
+    return {"id": r[0], "chat_id": r[1], "entry_date": r[2], "tasks": r[3], "annotation": r[4]}
+
+
+def practice_entries(chat_id: int) -> list:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, chat_id, entry_date, tasks, annotation FROM practice_entries "
+        "WHERE chat_id = ? ORDER BY entry_date, id",
+        (chat_id,),
+    ).fetchall()
+    conn.close()
+    return [_entry_row(r) for r in rows]
+
+
+def get_practice_entry(chat_id: int, entry_id: int):
+    conn = _connect()
+    row = conn.execute(
+        "SELECT id, chat_id, entry_date, tasks, annotation FROM practice_entries WHERE id = ? AND chat_id = ?",
+        (entry_id, chat_id),
+    ).fetchone()
+    conn.close()
+    return _entry_row(row) if row else None
+
+
+def update_practice_entry(chat_id: int, entry_id: int, **fields):
+    fields = {k: v for k, v in fields.items() if k in ("entry_date", "tasks", "annotation")}
+    if not fields:
+        return
+    conn = _connect()
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE practice_entries SET {sets} WHERE id = ? AND chat_id = ?", (*fields.values(), entry_id, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def delete_practice_entry(chat_id: int, entry_id: int):
+    conn = _connect()
+    conn.execute(
+        "DELETE FROM practice_photos WHERE entry_id IN (SELECT id FROM practice_entries WHERE id = ? AND chat_id = ?)",
+        (entry_id, chat_id),
+    )
+    conn.execute("DELETE FROM practice_entries WHERE id = ? AND chat_id = ?", (entry_id, chat_id))
+    conn.commit()
+    conn.close()
+
+
+def add_practice_photo(entry_id: int, file_id: str, caption: str) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO practice_photos (entry_id, file_id, caption, created_at) VALUES (?, ?, ?, ?)",
+        (entry_id, file_id, caption, _dt.now(KYIV_TZ).isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    photo_id = cur.lastrowid
+    conn.close()
+    return photo_id
+
+
+def update_practice_photo_caption(entry_id: int, photo_id: int, caption: str):
+    conn = _connect()
+    conn.execute(
+        "UPDATE practice_photos SET caption = ? WHERE id = ? AND entry_id = ?", (caption, photo_id, entry_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def practice_photos(entry_id: int) -> list:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT id, file_id, caption FROM practice_photos WHERE entry_id = ? ORDER BY id", (entry_id,)
+    ).fetchall()
+    conn.close()
+    return [{"id": r[0], "file_id": r[1], "caption": r[2]} for r in rows]
+
+
+def delete_practice_photo(photo_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM practice_photos WHERE id = ?", (photo_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- нагадування практики
+
+def get_practice_reminder(chat_id: int) -> dict:
+    conn = _connect()
+    row = conn.execute(
+        "SELECT diary_on, diary_time, sat_on, sat_time FROM practice_reminders WHERE chat_id = ?", (chat_id,)
+    ).fetchone()
+    conn.close()
+    if not row:
+        return {"diary_on": False, "diary_time": "20:00", "sat_on": False, "sat_time": "14:00"}
+    return {"diary_on": bool(row[0]), "diary_time": row[1], "sat_on": bool(row[2]), "sat_time": row[3]}
+
+
+def set_practice_reminder(chat_id: int, **fields):
+    allowed = {"diary_on", "diary_time", "sat_on", "sat_time"}
+    fields = {k: (int(v) if isinstance(v, bool) else v) for k, v in fields.items() if k in allowed}
+    if not fields:
+        return
+    conn = _connect()
+    conn.execute("INSERT OR IGNORE INTO practice_reminders (chat_id) VALUES (?)", (chat_id,))
+    sets = ", ".join(f"{k} = ?" for k in fields)
+    conn.execute(f"UPDATE practice_reminders SET {sets} WHERE chat_id = ?", (*fields.values(), chat_id))
+    conn.commit()
+    conn.close()
+
+
+def practice_reminder_users(kind: str) -> list:
+    """kind: 'diary' або 'sat'. Повертає [{'chat_id':..., 'time': 'HH:MM'}]"""
+    col_on, col_time = ("diary_on", "diary_time") if kind == "diary" else ("sat_on", "sat_time")
+    conn = _connect()
+    rows = conn.execute(f"SELECT chat_id, {col_time} FROM practice_reminders WHERE {col_on} = 1").fetchall()
+    conn.close()
+    return [{"chat_id": r[0], "time": r[1]} for r in rows]
+
+
+# --- новини практики
+
+def add_practice_news(group_name: str, title: str, body: str, created_by: int,
+                      file_id: str | None = None, file_type: str | None = None) -> int:
+    conn = _connect()
+    cur = conn.execute(
+        "INSERT INTO practice_news (group_name, title, body, file_id, file_type, created_by, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (group_name, title, body, file_id, file_type, created_by, _dt.now(KYIV_TZ).isoformat(timespec="seconds")),
+    )
+    conn.commit()
+    news_id = cur.lastrowid
+    conn.close()
+    return news_id
+
+
+def _news_row(r) -> dict:
+    return {"id": r[0], "group_name": r[1], "title": r[2], "body": r[3],
+            "file_id": r[4], "file_type": r[5], "created_at": r[6]}
+
+
+_NEWS_COLS = "id, group_name, title, body, file_id, file_type, created_at"
+
+
+def practice_news_page(group_name: str, offset: int, limit: int):
+    """Новини для групи (її власні + для всіх '*'), від новішої до старішої."""
+    conn = _connect()
+    total = conn.execute(
+        "SELECT COUNT(*) FROM practice_news WHERE group_name IN (?, '*')", (group_name,)
+    ).fetchone()[0]
+    rows = conn.execute(
+        f"SELECT {_NEWS_COLS} FROM practice_news WHERE group_name IN (?, '*') "
+        "ORDER BY id DESC LIMIT ? OFFSET ?",
+        (group_name, limit, offset),
+    ).fetchall()
+    conn.close()
+    return [_news_row(r) for r in rows], total
+
+
+def all_practice_news(limit: int = 30) -> list:
+    conn = _connect()
+    rows = conn.execute(f"SELECT {_NEWS_COLS} FROM practice_news ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    conn.close()
+    return [_news_row(r) for r in rows]
+
+
+def get_practice_news(news_id: int):
+    conn = _connect()
+    row = conn.execute(f"SELECT {_NEWS_COLS} FROM practice_news WHERE id = ?", (news_id,)).fetchone()
+    conn.close()
+    return _news_row(row) if row else None
+
+
+def delete_practice_news(news_id: int):
+    conn = _connect()
+    conn.execute("DELETE FROM practice_news WHERE id = ?", (news_id,))
+    conn.commit()
+    conn.close()
+
+
+# --- адмін: список студентів
+
+def practice_students(group_name: str) -> list:
+    """Усі користувачі групи з ім'ям з профілю (якщо є) та кількістю записів."""
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT u.chat_id, p.full_name, "
+        "(SELECT COUNT(*) FROM practice_entries e WHERE e.chat_id = u.chat_id) "
+        "FROM users u LEFT JOIN profiles p ON p.chat_id = u.chat_id "
+        "WHERE u.group_name = ? ORDER BY p.full_name IS NULL, p.full_name",
+        (group_name,),
+    ).fetchall()
+    conn.close()
+    return [{"chat_id": r[0], "full_name": r[1], "entries": r[2]} for r in rows]
+
+
+def users_without_profile() -> list:
+    conn = _connect()
+    rows = conn.execute(
+        "SELECT u.chat_id FROM users u LEFT JOIN profiles p ON p.chat_id = u.chat_id "
+        "WHERE p.full_name IS NULL OR p.full_name = ''"
+    ).fetchall()
+    conn.close()
+    return [r[0] for r in rows]
