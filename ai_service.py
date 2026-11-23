@@ -7,6 +7,7 @@ ai_service.py — тонкий async-клієнт до Google Gemini API (без
     GEMINI_API_KEY   — ключ з https://aistudio.google.com (Get API key)
     GEMINI_MODEL     — модель для коротких записів (за замовч. "gemini-4-hydrogen")
     GEMINI_MODEL_LONG— модель для звіту/тез (за замовч. = GEMINI_MODEL)
+    GEMINI_MODEL_FALLBACK — (необов'язково) запасна модель на випадок 503/429
 
 Безкоштовний ліміт ОДИН на весь ключ (тобто на всю групу разом), тому:
   * одночасно виконуємо не більше 2 запитів (Semaphore);
@@ -28,6 +29,8 @@ log = logging.getLogger("schedule-bot.ai")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 MODEL_FAST = os.environ.get("GEMINI_MODEL", "gemini-4-hydrogen")
 MODEL_LONG = os.environ.get("GEMINI_MODEL_LONG", MODEL_FAST)
+# Запасна модель: якщо основна перевантажена (HTTP 503/429), повтори йдуть на неї.
+MODEL_FALLBACK = os.environ.get("GEMINI_MODEL_FALLBACK", "")
 
 API_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 
@@ -101,12 +104,23 @@ async def generate(
                             else:
                                 del body["generationConfig"]["thinkingConfig"]
                             continue
+                        if resp.status == 429:
+                            blob = str(data).lower()
+                            if "perday" in blob or "per day" in blob or "daily" in blob:
+                                # ДЕННИЙ ліміт вичерпано: повтори на цій моделі марні
+                                last_error = "HTTP 429 (денний ліміт)"
+                                if MODEL_FALLBACK and model != MODEL_FALLBACK:
+                                    model = MODEL_FALLBACK
+                                    continue
+                                break
                         if resp.status not in (429, 500, 502, 503, 504):
                             log.error("Gemini помилка %s: %s", resp.status, str(data)[:300])
                             break
             except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 last_error = f"мережа: {e.__class__.__name__}"
-            await asyncio.sleep(4 * (attempt + 1))
+            if MODEL_FALLBACK and last_error in ("HTTP 503", "HTTP 429"):
+                model = MODEL_FALLBACK  # основна перевантажена — наступні спроби на запасній
+            await asyncio.sleep(3 * (attempt + 1))
 
     log.error("Gemini недоступний: %s", last_error)
     raise AIUnavailable(last_error)

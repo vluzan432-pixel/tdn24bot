@@ -14,6 +14,7 @@ practice.py — розділ «Практика» + «Мій профіль» (�
 import asyncio
 import html
 import logging
+import os
 import re
 import time
 from datetime import date, datetime, timedelta
@@ -583,6 +584,11 @@ async def desc_received(message: Message, state: FSMContext):
 
 
 async def _run_analyze(target, state: FSMContext):
+    # PRACTICE_SKIP_ANALYSIS=1 (змінна Render) — не ставити навідні запитання, одразу генерувати
+    # запис: економить 1 запит до ШІ на кожен запис, коли ліміт Gemini вузький.
+    if os.environ.get("PRACTICE_SKIP_ANALYSIS") == "1":
+        await _run_generate(target, state)
+        return
     data = await state.get_data()
     profile, cfg = _ctx(target.from_user.id)
     status = await msg_of(target).answer("⏳ Аналізую опис…")
