@@ -21,11 +21,11 @@ from PIL import Image, ImageOps
 
 FONT = "Times New Roman"
 
-# Титулка за зразком кафедри (Щоденник_практики_Лузан_В_О_.docx): угорі лише назва
-# документа, далі поля зліва без відступу, внизу по центру «Київ – Рік».
-# Якщо кафедра таки хоче два рядки «Київський національний університет… / Кафедра…»
-# вгорі по центру — постав True.
-TITLE_SHOW_UNIVERSITY = False
+# Титулка за офіційним зразком кафедри (вимоги для 3 курсу): угорі по центру
+# «Київський національний університет культури і мистецтв / Кафедра музичного мистецтва»,
+# нижче назва документа, далі поля зліва, внизу по центру «Київ-Рік».
+# Якщо шапку вгорі прибрати (як у деяких студентських робіт) — постав False.
+TITLE_SHOW_UNIVERSITY = True
 CITY_SPACE_BEFORE_PT = 375  # відступ перед «Київ – Рік», щоб рядок був унизу сторінки
 
 PLACEHOLDER_RE = re.compile(r"(\[(?:ПЕРЕВІРИТИ|ДОДАТИ)[^\]]*\])")
@@ -197,8 +197,9 @@ def _title_page(doc, profile: dict, cfg: dict, title_lines: list, terms: bool):
         _par(doc, cfg["university"], align=C, **S)
         _par(doc, cfg["department"], align=C, **S)
 
-    for line in title_lines:
-        _par(doc, line["text"], bold=line.get("bold", False), align=C, **S)
+    for i, line in enumerate(title_lines):
+        _par(doc, line["text"], bold=line.get("bold", False), align=C,
+             before=(60 if (i == 0 and TITLE_SHOW_UNIVERSITY) else 0), **S)
     _par(doc, "", align=C, **S)
     _par(doc, "", align=C, **S)
 
@@ -230,8 +231,8 @@ def _title_page(doc, profile: dict, cfg: dict, title_lines: list, terms: bool):
     if terms:
         field("Терміни: ", cfg.get("terms") or "__________")
 
-    space = CITY_SPACE_BEFORE_PT - (30 if terms else 0) - (60 if TITLE_SHOW_UNIVERSITY else 0)
-    _par(doc, f"Київ – {cfg['year']}", align=C, before=space, **S)
+    space = CITY_SPACE_BEFORE_PT - (30 if terms else 0) - (110 if TITLE_SHOW_UNIVERSITY else 0)
+    _par(doc, f"Київ-{cfg['year']}", align=C, before=space, **S)
 
 
 # ------------------------------------------------------------------ щоденник
@@ -261,9 +262,18 @@ def _week_start(iso: str) -> date:
     return d - timedelta(days=d.weekday())
 
 
+def _fill_cell(cell, text: str, align, size: int = 12):
+    """Текст у клітинку: кожен непорожній рядок — окремий абзац (як у зразку кафедри)."""
+    lines = [re.sub(r"^[-•–]\s+", "– ", l.strip()) for l in _clean(text).split("\n") if l.strip()]
+    for i, line in enumerate(lines or [""]):
+        p = cell.paragraphs[0] if i == 0 else cell.add_paragraph()
+        _format_par(p, align=align, spacing=1.15, after=(3 if i < len(lines) - 1 else 0))
+        _add_text(p, line, size)
+
+
 def _week_table(doc, week_entries: list):
-    """Таблиця одного тижня. Номери 1., 2., ... починаються з 1 у кожному тижні; записи
-    одного дня стоять підряд, а клітинки «№» і «Дата» для них об'єднані по вертикалі."""
+    """Таблиця одного тижня. Кожен запис — окремий рядок зі своїм номером (1., 2., ...),
+    нумерація починається з 1 у кожному тижні (як у зразку кафедри)."""
     headers = ["№ з/п", "Дата", "Перелік виконаних завдань та робот", "Анотація"]
     table = doc.add_table(rows=1, cols=4)
     table.style = "Table Grid"
@@ -285,37 +295,14 @@ def _week_table(doc, week_entries: list):
         _format_par(p, align=WD_ALIGN_PARAGRAPH.CENTER, spacing=1.15)
         _add_text(p, text, 12)
 
-    # групуємо записи за датою (вони вже відсортовані)
-    groups = []
-    for e in week_entries:
-        if groups and groups[-1][0] == e["entry_date"]:
-            groups[-1][1].append(e)
-        else:
-            groups.append((e["entry_date"], [e]))
-
-    for number, (iso, day_entries) in enumerate(groups, start=1):
-        rows = []
-        for e in day_entries:
-            row = table.add_row()
-            rows.append(row)
-            for i, (text, align) in enumerate([
-                (None, None), (None, None),
-                (_clean(e["tasks"]), WD_ALIGN_PARAGRAPH.LEFT),
-                (_clean(e["annotation"]), WD_ALIGN_PARAGRAPH.JUSTIFY),
-            ]):
-                cell = row.cells[i]
-                _set_cell_width(cell, DIARY_WIDTHS[i])
-                if text is not None:
-                    p = cell.paragraphs[0]
-                    _format_par(p, align=align, spacing=1.15)
-                    _add_text(p, text, 12)
-        if len(rows) > 1:
-            rows[0].cells[0].merge(rows[-1].cells[0])
-            rows[0].cells[1].merge(rows[-1].cells[1])
-        for i, text in enumerate([f"{number}.", fmt_date_short(iso)]):
-            p = rows[0].cells[i].paragraphs[0]
-            _format_par(p, align=WD_ALIGN_PARAGRAPH.CENTER, spacing=1.15)
-            _add_text(p, text, 12)
+    for number, e in enumerate(week_entries, start=1):
+        row = table.add_row()
+        for i in range(4):
+            _set_cell_width(row.cells[i], DIARY_WIDTHS[i])
+        _fill_cell(row.cells[0], f"{number}.", WD_ALIGN_PARAGRAPH.CENTER)
+        _fill_cell(row.cells[1], fmt_date_short(e["entry_date"]), WD_ALIGN_PARAGRAPH.CENTER)
+        _fill_cell(row.cells[2], e["tasks"], WD_ALIGN_PARAGRAPH.LEFT)
+        _fill_cell(row.cells[3], e["annotation"], WD_ALIGN_PARAGRAPH.JUSTIFY)
     return table
 
 
@@ -359,29 +346,23 @@ def build_diary(profile: dict, cfg: dict, entries: list) -> bytes:
 REPORT_TOC = [
     (0, "ВСТУП"),
     (0, "РОЗДІЛ І. ЗАГАЛЬНІ ВИДИ ЗАВДАНЬ"),
-    (1, "1.1. Творчий колектив"),
-    (1, "1.2. Аналіз сайтів мистецьких та культурно-освітніх установ"),
-    (1, "1.3. Майстер-класи і творчі зустрічі з провідними майстрами мистецтв"),
+    (1, "1.1. Робота у творчих колективах"),
+    (1, "1.2. Майстер-класи і творчі зустрічі з провідними майстрами мистецтв"),
     (0, "РОЗДІЛ ІІ. ІНДИВІДУАЛЬНІ ЗАВДАННЯ ДО САМОСТІЙНОЇ РОБОТИ"),
     (1, "2.1. Репертуар різних форм і стилів"),
-    (1, "2.2. Виконавський аналіз музичних творів програми з фаху"),
-    (1, "2.3. Аналіз музично-теоретичної літератури"),
+    (1, "2.2. Онлайн-документація професійних мистецьких колективів"),
+    (1, "2.3. Методична та інформаційна література з питань менеджменту у мистецькій сфері"),
     (0, "ВИСНОВОК"),
     (0, "ЛІТЕРАТУРА"),
     (0, "ІНФОРМАЦІЙНІ РЕСУРСИ"),
     (0, "ДОДАТКИ"),
 ]
 
-COLLECTIVE_POINTS = [
-    ("name", "Назва колективу"),
+# схема довідки про колектив / установу (підрозділ 2.2)
+INSTITUTION_POINTS = [
     ("year", "Рік створення"),
     ("direction", "Творче спрямування"),
-    ("leaders", "Керівники"),
-    ("performers", "Провідні виконавці"),
-    ("repertoire", "Особливості репертуару"),
-    ("concerts", "Концертна діяльність"),
-    ("achievements", "Мистецькі досягнення"),
-    ("features", "Особливості функціонування"),
+    ("documents", "Опрацьовані законодавчі та нормативні документи, що стосуються функціонування колективу"),
 ]
 
 
@@ -458,18 +439,18 @@ def _enable_update_fields(doc):
     settings.append(el)
 
 
-def _collective_blocks(doc, collectives: list):
-    for n, c in enumerate(collectives, start=1):
-        _par(doc, f"{n}. {_clean(str(c.get('name') or '[ДОДАТИ: назва колективу]'))}", size=14, bold=True,
+def _institution_blocks(doc, institutions: list):
+    for n, c in enumerate(institutions, start=1):
+        _par(doc, f"{n}. {_clean(str(c.get('name') or '[ДОДАТИ: назва колективу / установи]'))}", size=14, bold=True,
              align=WD_ALIGN_PARAGRAPH.LEFT, spacing=1.5, first_indent=1.25, keep_next=True)
-        for i, (key, label) in enumerate(COLLECTIVE_POINTS[1:], start=2):
+        for key, label in INSTITUTION_POINTS:
             value = _clean(str(c.get(key) or "")) or "[ДОДАТИ: немає даних]"
-            _par(doc, f"{i}) {label}: {value}", size=14, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
+            _par(doc, f"– {label}: {value}", size=14, align=WD_ALIGN_PARAGRAPH.JUSTIFY,
                  spacing=1.5, first_indent=1.25)
 
 
 def build_report(profile: dict, cfg: dict, sections: dict, entries: list) -> bytes:
-    """sections: intro, s11, s12 {'intro','collectives'[], 'outro'}, s13, s21, s22, s23,
+    """sections: intro, s11, s12, s21, s22 {'intro','institutions'[], 'outro'}, s23,
     conclusion, literature [str], resources [str], media_links [str]"""
     entries = sorted(entries, key=lambda e: e["entry_date"])
     doc = Document()
@@ -501,25 +482,21 @@ def build_report(profile: dict, cfg: dict, sections: dict, entries: list) -> byt
     _body(doc, sections.get("intro", ""))
 
     _heading(doc, "РОЗДІЛ І. ЗАГАЛЬНІ ВИДИ ЗАВДАНЬ", 1, new_page=True)
-    _heading(doc, "1.1. Творчий колектив", 2)
+    _heading(doc, "1.1. Робота у творчих колективах", 2)
     _body(doc, sections.get("s11", ""))
-
-    _heading(doc, "1.2. Аналіз сайтів мистецьких та культурно-освітніх установ", 2)
-    s12 = sections.get("s12") or {}
-    _body(doc, s12.get("intro", ""))
-    _collective_blocks(doc, s12.get("collectives") or [])
-    if s12.get("outro"):
-        _body(doc, s12["outro"])
-
-    _heading(doc, "1.3. Майстер-класи і творчі зустрічі з провідними майстрами мистецтв", 2)
-    _body(doc, sections.get("s13", ""))
+    _heading(doc, "1.2. Майстер-класи і творчі зустрічі з провідними майстрами мистецтв", 2)
+    _body(doc, sections.get("s12", ""))
 
     _heading(doc, "РОЗДІЛ ІІ. ІНДИВІДУАЛЬНІ ЗАВДАННЯ ДО САМОСТІЙНОЇ РОБОТИ", 1, new_page=True)
     _heading(doc, "2.1. Репертуар різних форм і стилів", 2)
     _body(doc, sections.get("s21", ""))
-    _heading(doc, "2.2. Виконавський аналіз музичних творів програми з фаху", 2)
-    _body(doc, sections.get("s22", ""))
-    _heading(doc, "2.3. Аналіз музично-теоретичної літератури", 2)
+    _heading(doc, "2.2. Онлайн-документація професійних мистецьких колективів", 2)
+    s22 = sections.get("s22") or {}
+    _body(doc, s22.get("intro", ""))
+    _institution_blocks(doc, s22.get("institutions") or [])
+    if s22.get("outro"):
+        _body(doc, s22["outro"])
+    _heading(doc, "2.3. Методична та інформаційна література з питань менеджменту у мистецькій сфері", 2)
     _body(doc, sections.get("s23", ""))
 
     _heading(doc, "ВИСНОВОК", 1, new_page=True)
