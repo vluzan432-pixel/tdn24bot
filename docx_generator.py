@@ -272,8 +272,8 @@ def _fill_cell(cell, text: str, align, size: int = 12):
 
 
 def _week_table(doc, week_entries: list):
-    """Таблиця одного тижня. Кожен запис — окремий рядок зі своїм номером (1., 2., ...),
-    нумерація починається з 1 у кожному тижні (як у зразку кафедри)."""
+    """Таблиця одного тижня. Кожен запис — окремий рядок зі своїм номером; усередині однієї
+    дати записи нумеруються 1., 2., 3., а нова дата знову починає з 1."""
     headers = ["№ з/п", "Дата", "Перелік виконаних завдань та робот", "Анотація"]
     table = doc.add_table(rows=1, cols=4)
     table.style = "Table Grid"
@@ -295,7 +295,9 @@ def _week_table(doc, week_entries: list):
         _format_par(p, align=WD_ALIGN_PARAGRAPH.CENTER, spacing=1.15)
         _add_text(p, text, 12)
 
-    for number, e in enumerate(week_entries, start=1):
+    per_date = {}  # нумерація 1, 2, 3… починається заново для кожної дати
+    for e in week_entries:
+        number = per_date[e["entry_date"]] = per_date.get(e["entry_date"], 0) + 1
         row = table.add_row()
         for i in range(4):
             _set_cell_width(row.cells[i], DIARY_WIDTHS[i])
