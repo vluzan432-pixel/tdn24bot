@@ -186,6 +186,27 @@ async def generate_entry(profile: dict, cfg: dict, date_str: str, description: s
     return {"tasks": str(data["tasks"]).strip(), "annotation": str(data["annotation"]).strip()}
 
 
+async def rewrite_entry(profile: dict, cfg: dict, entry: dict) -> dict:
+    """Переписує вже збережений запис від першої особи, НЕ змінюючи фактів. Повертає {'tasks','annotation'}."""
+    system = (
+        "Ти — помічник студента-музиканта. Тобі дано вже готовий запис щоденника практики. Перепиши його "
+        "так, щоб він був написаний від першої особи за правилами нижче, зберігши ВСІ факти, назви творів, "
+        "колективів, дати й обсяг; нічого нового не вигадуй і не прибирай. Поле tasks залиш коротким. "
+        "Прибери позначки [ПЕРЕВІРИТИ…], якщо вони стоять на планах чи припущеннях; залиш лише ті, "
+        "де справді бракує ключового факту.\n"
+        f"{VOICE_RULES}\n{DIARY_RULES}\n\n{STYLE_EXAMPLES}\n\n"
+        'Відповідь — ЛИШЕ JSON: {"tasks": "...", "annotation": "..."}.'
+    )
+    prompt = (
+        f"ПРОФІЛЬ:\n{profile_context(profile, cfg)}\n\nДАТА: {entry['entry_date']}\n\n"
+        f"ПОТОЧНИЙ ЗАПИС.\nПерелік: {entry['tasks']}\nАнотація: {entry['annotation']}"
+    )
+    data = await ai.generate_json(system, prompt, temperature=0.5, max_tokens=2000)
+    if not isinstance(data, dict) or not data.get("tasks") or not data.get("annotation"):
+        raise ai.AIUnavailable("ШІ повернув неповний запис")
+    return {"tasks": str(data["tasks"]).strip(), "annotation": str(data["annotation"]).strip()}
+
+
 # ------------------------------------------------------------ звіт
 
 def diary_digest(entries: list, max_chars_per_entry: int = 450) -> str:

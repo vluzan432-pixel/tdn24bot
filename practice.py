@@ -921,8 +921,8 @@ async def cb_rewrite_all_ok(callback: CallbackQuery):
                 draft = await practice_ai.rewrite_entry(profile, cfg, e)
                 db.update_practice_entry(chat_id, e["id"], tasks=draft["tasks"], annotation=draft["annotation"])
                 done += 1
-            except ai.AIUnavailable as err:
-                log.warning("rewrite_all: %s", err)
+            except Exception as err:  # будь-яка помилка на одному записі не має зупиняти решту
+                log.exception("rewrite_all: запис %s: %s", e["id"], err)
                 failed += 1
             try:
                 await status.edit_text(f"⏳ Переписую: {i}/{len(entries)}")
