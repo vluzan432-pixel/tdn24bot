@@ -21,7 +21,7 @@ from datetime import date, datetime, timedelta
 
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.filters import StateFilter
+from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -878,6 +878,64 @@ async def edit_received(message: Message, state: FSMContext):
     db.update_practice_entry(message.from_user.id, entry_id, **{field: value})
     await state.clear()
     await message.answer("Збережено ✅", reply_markup=kb([btn("📋 До запису", f"pr_view:{entry_id}")]))
+
+
+@router.message(Command("rewrite_entries"))
+async def cmd_rewrite_entries(message: Message):
+    """Одноразова службова команда (не в меню): переписує ВЛАСНІ збережені записи адміна
+    від першої особи. Після того як старі записи оновлено, команду й цей блок можна видалити."""
+    if not _admin(message):
+        return
+    n = len(db.practice_entries(message.from_user.id))
+    if not n:
+        await message.answer("У тебе ще немає записів.")
+        return
+    await message.answer(
+        f"♻️ Переписати <b>всі твої {n} записів</b> від першої особи? Факти зберігаються, але формулювання "
+        "(і ручні правки в анотаціях) будуть замінені. Це може тривати кілька хвилин.",
+        reply_markup=kb([btn("♻️ Так, переписати", "pr_rwall_ok")], [btn("❌ Скасувати", "pr_cancel")]),
+    )
+
+
+@router.callback_query(F.data == "pr_rwall_ok")
+async def cb_rewrite_all_ok(callback: CallbackQuery):
+    chat_id = callback.from_user.id
+    if not _admin(callback):
+        await callback.answer("Недоступно", show_alert=True)
+        return
+    if ("rewrite", chat_id) in _busy:
+        await callback.answer("Вже переписую, зачекай 🙂", show_alert=True)
+        return
+    entries = db.practice_entries(chat_id)
+    if not entries:
+        await callback.answer("Записів немає", show_alert=True)
+        return
+    _busy.add(("rewrite", chat_id))
+    await callback.answer()
+    status = await callback.message.answer(f"⏳ Переписую: 0/{len(entries)}")
+    done = failed = 0
+    try:
+        profile, cfg = _ctx(chat_id)
+        for i, e in enumerate(entries, 1):
+            try:
+                draft = await practice_ai.rewrite_entry(profile, cfg, e)
+                db.update_practice_entry(chat_id, e["id"], tasks=draft["tasks"], annotation=draft["annotation"])
+                done += 1
+            except ai.AIUnavailable as err:
+                log.warning("rewrite_all: %s", err)
+                failed += 1
+            try:
+                await status.edit_text(f"⏳ Переписую: {i}/{len(entries)}")
+            except TelegramBadRequest:
+                pass
+            await asyncio.sleep(1.5)
+    finally:
+        _busy.discard(("rewrite", chat_id))
+    text = f"Готово ✅ Переписано записів: {done} з {len(entries)}."
+    if failed:
+        text += f"\n⚠️ {failed} не вдалося (ШІ був недоступний) — запусти ще раз, оновляться лише ті, що лишились; "
+        text += "уже переписані ШІ просто обробить повторно."
+    await status.edit_text(text, reply_markup=kb([btn("📋 До списку", "pr_list:0")]))
 
 
 @router.callback_query(F.data.startswith("pr_del:"))
